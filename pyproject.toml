@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-academic-paper-chatbot"
+version = "0.1.0.dev0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi",
+  "httpx",
+  "jinja2",
+  "keyring",
+  "numpy",
+  "onnxruntime",
+  "pdfplumber",
+  "platformdirs",
+  "psutil",
+  "pydantic>=2",
+  "pydantic-settings",
+  "pypdfium2",
+  "python-multipart",
+  "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy",
+  "pip-tools",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "reportlab",
+  "respx",
+  "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+markers = [
+  "llama_cpp: requires a pinned local llama.cpp runtime and GGUF",
+  "reference_hardware: runs only on the recorded 16 GB machine",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["academic_chatbot"]

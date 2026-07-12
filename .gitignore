@@ -2,3 +2,15 @@
 .superpowers/
 .qa/
 docs/*_draft.docx
+
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+*.gguf
+benchmarks/raw/
+corpora/private/
