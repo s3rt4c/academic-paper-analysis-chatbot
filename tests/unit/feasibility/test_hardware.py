@@ -43,8 +43,14 @@ def _sample_facts() -> HardwareFacts:
 
 
 def _sample_record() -> ReferenceHardwareRecord:
+    return _record_from_facts(_sample_facts())
+
+
+def _record_from_facts(
+    facts: HardwareFacts, *, gpu_offload_available: bool = False
+) -> ReferenceHardwareRecord:
     return build_record(
-        facts=_sample_facts(),
+        facts=facts,
         gguf_name="research-model-Q4_K_M.gguf",
         gguf_sha256="1" * 64,
         gguf_quantization="Q4_K_M",
@@ -53,7 +59,7 @@ def _sample_record() -> ReferenceHardwareRecord:
         llama_flags=("--ctx-size", "4096", "--parallel", "1"),
         runtime_manifest_sha256="3" * 64,
         benchmark_corpus_sha256="4" * 64,
-        gpu_offload_available=False,
+        gpu_offload_available=gpu_offload_available,
         collected_at="2026-07-11T00:00:00Z",
     )
 
@@ -124,7 +130,6 @@ def test_reference_models_are_frozen_and_validate_hashes() -> None:
             gpu_offload_available=False,
             collected_at="2026-07-11T00:00:00Z",
         )
-
 
 def test_collect_command_writes_canonical_facts_without_final_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -326,16 +331,50 @@ def test_reference_builder_rejects_impossible_hardware_relationships() -> None:
         )
 
     with pytest.raises(ValidationError, match="gpu_offload_available"):
-        build_record(
-            facts=_sample_facts(),
-            gguf_name="research-model-Q4_K_M.gguf",
-            gguf_sha256="1" * 64,
-            gguf_quantization="Q4_K_M",
-            model_manifest_sha256="2" * 64,
-            llama_release="b-test",
-            llama_flags=("--ctx-size", "4096"),
-            runtime_manifest_sha256="3" * 64,
-            benchmark_corpus_sha256="4" * 64,
-            gpu_offload_available=True,
-            collected_at="2026-07-11T00:00:00Z",
-        )
+        _record_from_facts(_sample_facts(), gpu_offload_available=True)
+
+
+def test_reference_builder_requires_exact_16_gib_and_complete_ram_slots() -> None:
+    eight_gib_module = MemoryModuleFact(
+        capacity_bytes=8 * 1024**3,
+        speed_mhz=5600,
+        manufacturer="Test Memory",
+        part_number="TEST-8G",
+        bank_label="BANK 0",
+        device_locator="DIMM 0",
+    )
+    eight_gib_facts = _sample_facts().model_copy(
+        update={
+            "ram_bytes": 8 * 1024**3,
+            "usable_ram_bytes": 7 * 1024**3,
+            "ram_layout": (eight_gib_module,),
+        }
+    )
+    with pytest.raises(ValidationError, match="16 GiB"):
+        _record_from_facts(eight_gib_facts)
+
+    incomplete_module = eight_gib_module.model_copy(
+        update={
+            "capacity_bytes": 16 * 1024**3,
+            "speed_mhz": None,
+            "bank_label": None,
+        }
+    )
+    incomplete_slot_facts = _sample_facts().model_copy(
+        update={"ram_layout": (incomplete_module,)}
+    )
+    with pytest.raises(ValidationError, match=r"speed_mhz|bank_label"):
+        _record_from_facts(incomplete_slot_facts)
+
+
+def test_reference_builder_preserves_unresolved_offload_diagnostics() -> None:
+    facts = _sample_facts().model_copy(
+        update={
+            "collection_diagnostics": (
+                "gpu_offload_available: pinned runtime measurement failed",
+            )
+        }
+    )
+
+    with pytest.raises(ValidationError, match="gpu_offload_available"):
+        _record_from_facts(facts)

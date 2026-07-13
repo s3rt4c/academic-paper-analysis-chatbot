@@ -25,6 +25,9 @@ _COMMAND_TIMEOUT_SECONDS = 10
 _BACKGROUND_LOAD_POLICY = (
     "Close non-essential applications and record the complete application process tree."
 )
+_GPU_OFFLOAD_PENDING_DIAGNOSTIC = (
+    "gpu_offload_available: requires pinned llama.cpp runtime binding"
+)
 _PROCESSOR_FEATURES = (
     (6, "SSE"),
     (10, "SSE2"),
@@ -145,6 +148,8 @@ class ReferenceHardwareRecord(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def _validate_record_hash(self) -> Self:
+        if self.ram_bytes != 16 * 1024**3:
+            raise ValueError("ram_bytes must equal the exact 16 GiB reference target")
         if self.physical_cores > self.logical_cores:
             raise ValueError("physical_cores cannot exceed logical_cores")
         if self.usable_ram_bytes > self.ram_bytes:
@@ -152,6 +157,13 @@ class ReferenceHardwareRecord(_StrictFrozenModel):
         module_capacities = tuple(module.capacity_bytes for module in self.ram_layout)
         if any(capacity is None for capacity in module_capacities):
             raise ValueError("ram_layout capacity_bytes must be complete")
+        for module in self.ram_layout:
+            if module.speed_mhz is None:
+                raise ValueError("ram_layout speed_mhz must be complete")
+            if module.bank_label is None:
+                raise ValueError("ram_layout bank_label must be complete")
+            if module.device_locator is None:
+                raise ValueError("ram_layout device_locator must be complete")
         installed_from_modules = sum(
             capacity for capacity in module_capacities if capacity is not None
         )
@@ -232,7 +244,7 @@ def build_record(
     fact_payload["collection_diagnostics"] = [
         item
         for item in facts.collection_diagnostics
-        if not item.startswith("gpu_offload_available:")
+        if item != _GPU_OFFLOAD_PENDING_DIAGNOSTIC
     ]
     payload: dict[str, object] = {
         **fact_payload,
@@ -640,9 +652,7 @@ def collect_windows_hardware() -> HardwareFacts:
     gpu_model, vram_bytes, gpu_diagnostic = _collect_gpu()
     if gpu_diagnostic is not None:
         diagnostics.append(gpu_diagnostic)
-    diagnostics.append(
-        "gpu_offload_available: requires pinned llama.cpp runtime binding"
-    )
+    diagnostics.append(_GPU_OFFLOAD_PENDING_DIAGNOSTIC)
 
     storage_kind, storage_diagnostic = _collect_storage_kind()
     if storage_diagnostic is not None:
