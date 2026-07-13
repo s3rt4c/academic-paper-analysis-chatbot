@@ -13,4 +13,5 @@ build/
 *.egg-info/
 *.gguf
 benchmarks/raw/
+benchmarks/work/
 corpora/private/
