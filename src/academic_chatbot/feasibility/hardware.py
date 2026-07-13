@@ -105,27 +105,27 @@ class HardwareFacts(_StrictFrozenModel):
 
 class ReferenceHardwareRecord(_StrictFrozenModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
-    cpu_model: str | None
-    physical_cores: int | None = Field(default=None, gt=0)
-    logical_cores: int | None = Field(default=None, gt=0)
-    instruction_sets: tuple[str, ...] | None
-    ram_bytes: int | None = Field(default=None, gt=0)
-    usable_ram_bytes: int | None = Field(default=None, gt=0)
-    ram_layout: tuple[MemoryModuleFact, ...] | None
-    windows_build: str | None
-    power_profile: str | None
+    cpu_model: str = Field(min_length=1)
+    physical_cores: int = Field(gt=0)
+    logical_cores: int = Field(gt=0)
+    instruction_sets: tuple[str, ...] = Field(min_length=1)
+    ram_bytes: int = Field(gt=0)
+    usable_ram_bytes: int = Field(gt=0)
+    ram_layout: tuple[MemoryModuleFact, ...] = Field(min_length=1)
+    windows_build: str = Field(min_length=1)
+    power_profile: str = Field(min_length=1)
     gpu_model: str | None
     vram_bytes: int | None = Field(default=None, ge=0)
-    gpu_offload_available: bool | None
-    storage_kind: str | None
-    background_load_policy: str
+    gpu_offload_available: bool
+    storage_kind: str = Field(min_length=1)
+    background_load_policy: str = Field(min_length=1)
     collection_diagnostics: tuple[str, ...]
     gguf_name: str = Field(min_length=1)
     gguf_sha256: str = Field(pattern=_SHA256_PATTERN)
     gguf_quantization: str = Field(min_length=1)
     model_manifest_sha256: str = Field(pattern=_SHA256_PATTERN)
     llama_release: str = Field(min_length=1)
-    llama_flags: tuple[str, ...] = ()
+    llama_flags: tuple[str, ...] = Field(min_length=1)
     runtime_manifest_sha256: str = Field(pattern=_SHA256_PATTERN)
     benchmark_corpus_sha256: str = Field(pattern=_SHA256_PATTERN)
     collected_at: str = Field(min_length=1)
@@ -136,8 +136,38 @@ class ReferenceHardwareRecord(_StrictFrozenModel):
     def _validate_collected_at(cls, value: str) -> str:
         return _validate_utc_timestamp(value)
 
+    @field_validator("gguf_name")
+    @classmethod
+    def _validate_gguf_name(cls, value: str) -> str:
+        if Path(value).name != value or Path(value).suffix.casefold() != ".gguf":
+            raise ValueError("gguf_name must be a file name ending in .gguf")
+        return value
+
     @model_validator(mode="after")
     def _validate_record_hash(self) -> Self:
+        if self.physical_cores > self.logical_cores:
+            raise ValueError("physical_cores cannot exceed logical_cores")
+        if self.usable_ram_bytes > self.ram_bytes:
+            raise ValueError("usable_ram_bytes cannot exceed installed ram_bytes")
+        module_capacities = tuple(module.capacity_bytes for module in self.ram_layout)
+        if any(capacity is None for capacity in module_capacities):
+            raise ValueError("ram_layout capacity_bytes must be complete")
+        installed_from_modules = sum(
+            capacity for capacity in module_capacities if capacity is not None
+        )
+        if installed_from_modules != self.ram_bytes:
+            raise ValueError("ram_bytes must equal the complete ram_layout capacity sum")
+        if self.gpu_model is None and self.gpu_offload_available:
+            raise ValueError("gpu_offload_available cannot be true without a GPU")
+        if self.gpu_model is not None and self.vram_bytes is None:
+            raise ValueError("vram_bytes must be known when gpu_model is present")
+        if any(
+            item.startswith("gpu_offload_available:")
+            for item in self.collection_diagnostics
+        ):
+            raise ValueError(
+                "gpu_offload_available diagnostics must be resolved before binding"
+            )
         payload = self.model_dump(mode="json", exclude={"record_sha256"})
         expected = canonical_sha256(payload)
         if not hmac.compare_digest(self.record_sha256, expected):
@@ -199,6 +229,11 @@ def build_record(
     fact_payload = facts.model_dump(mode="json")
     fact_payload.pop("collected_at", None)
     fact_payload["gpu_offload_available"] = gpu_offload_available
+    fact_payload["collection_diagnostics"] = [
+        item
+        for item in facts.collection_diagnostics
+        if not item.startswith("gpu_offload_available:")
+    ]
     payload: dict[str, object] = {
         **fact_payload,
         "gguf_name": gguf_name,

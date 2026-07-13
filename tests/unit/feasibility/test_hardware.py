@@ -289,3 +289,53 @@ def test_writer_revalidates_constructed_reference_record(tmp_path: Path) -> None
 
     with pytest.raises(ValidationError, match="record_sha256"):
         hardware.write_reference_hardware(tmp_path / "reference.json", forged)
+
+
+def test_reference_builder_rejects_incomplete_hardware_facts() -> None:
+    with pytest.raises(ValidationError, match="cpu_model"):
+        build_record(
+            facts=HardwareFacts(collected_at="2026-07-11T00:00:00Z"),
+            gguf_name="research-model-Q4_K_M.gguf",
+            gguf_sha256="1" * 64,
+            gguf_quantization="Q4_K_M",
+            model_manifest_sha256="2" * 64,
+            llama_release="b-test",
+            llama_flags=("--ctx-size", "4096"),
+            runtime_manifest_sha256="3" * 64,
+            benchmark_corpus_sha256="4" * 64,
+            gpu_offload_available=False,
+            collected_at="2026-07-11T00:00:00Z",
+        )
+
+
+def test_reference_builder_rejects_impossible_hardware_relationships() -> None:
+    inconsistent_ram = _sample_facts().model_copy(update={"ram_bytes": 8 * 1024**3})
+    with pytest.raises(ValidationError, match="ram_bytes"):
+        build_record(
+            facts=inconsistent_ram,
+            gguf_name="research-model-Q4_K_M.gguf",
+            gguf_sha256="1" * 64,
+            gguf_quantization="Q4_K_M",
+            model_manifest_sha256="2" * 64,
+            llama_release="b-test",
+            llama_flags=("--ctx-size", "4096"),
+            runtime_manifest_sha256="3" * 64,
+            benchmark_corpus_sha256="4" * 64,
+            gpu_offload_available=False,
+            collected_at="2026-07-11T00:00:00Z",
+        )
+
+    with pytest.raises(ValidationError, match="gpu_offload_available"):
+        build_record(
+            facts=_sample_facts(),
+            gguf_name="research-model-Q4_K_M.gguf",
+            gguf_sha256="1" * 64,
+            gguf_quantization="Q4_K_M",
+            model_manifest_sha256="2" * 64,
+            llama_release="b-test",
+            llama_flags=("--ctx-size", "4096"),
+            runtime_manifest_sha256="3" * 64,
+            benchmark_corpus_sha256="4" * 64,
+            gpu_offload_available=True,
+            collected_at="2026-07-11T00:00:00Z",
+        )
