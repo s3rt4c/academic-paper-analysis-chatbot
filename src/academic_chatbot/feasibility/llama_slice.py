@@ -3957,7 +3957,7 @@ _DEFAULT_MODEL_PROFILE = FrozenModelProfile(
     license_url=_APACHE_2_LICENSE_URL,
     model_card_url=(
         "https://huggingface.co/Qwen/Qwen3-8B-GGUF/blob/"
-        "6a569868d07d3bd59e8b97fb001bf8c0b254bb20/README.md"
+        "6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf"
     ),
     immutable_file_url=(
         "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/"
@@ -3976,7 +3976,7 @@ _FALLBACK_MODEL_PROFILE = FrozenModelProfile(
     license_url=_APACHE_2_LICENSE_URL,
     model_card_url=(
         "https://huggingface.co/Qwen/Qwen3-4B-GGUF/blob/"
-        "a9a60d009fa7ff9606305047c2bf77ac25dbec49/README.md"
+        "a9a60d009fa7ff9606305047c2bf77ac25dbec49/Qwen3-4B-Q4_K_M.gguf"
     ),
     immutable_file_url=(
         "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/"

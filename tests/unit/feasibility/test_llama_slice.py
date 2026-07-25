@@ -5128,13 +5128,25 @@ def test_model_import_normalizes_gguf_structure_and_semantic_failures(
 
 
 @pytest.mark.parametrize(
-    "profile_id",
-    [llama_slice.DEFAULT_MODEL_PROFILE_ID, llama_slice.FALLBACK_MODEL_PROFILE_ID],
+    ("profile_id", "expected_metadata_page_url"),
+    [
+        (
+            llama_slice.DEFAULT_MODEL_PROFILE_ID,
+            "https://huggingface.co/Qwen/Qwen3-8B-GGUF/blob/"
+            "6a569868d07d3bd59e8b97fb001bf8c0b254bb20/Qwen3-8B-Q4_K_M.gguf",
+        ),
+        (
+            llama_slice.FALLBACK_MODEL_PROFILE_ID,
+            "https://huggingface.co/Qwen/Qwen3-4B-GGUF/blob/"
+            "a9a60d009fa7ff9606305047c2bf77ac25dbec49/Qwen3-4B-Q4_K_M.gguf",
+        ),
+    ],
 )
 def test_model_import_builds_and_publishes_exact_canonical_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     profile_id: str,
+    expected_metadata_page_url: str,
 ) -> None:
     inputs = _tiny_model_import_inputs(
         tmp_path,
@@ -5145,6 +5157,7 @@ def test_model_import_builds_and_publishes_exact_canonical_manifest(
     manifest = _import_tiny_model(inputs)
 
     assert manifest.profile_id == profile_id
+    assert manifest.model_card_url == expected_metadata_page_url
     for field_name, value in inputs.profile.model_dump(mode="python").items():
         assert getattr(manifest, field_name) == value
     expected_metadata = llama_slice._qwen3_tokenizer_metadata_from_snapshot(
