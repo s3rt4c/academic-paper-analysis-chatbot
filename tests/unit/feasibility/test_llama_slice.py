@@ -6133,17 +6133,39 @@ def test_step7_version_parser_rejects_wrong_or_ambiguous_identity(output: bytes)
         llama_slice.parse_llama_server_version(output)
 
 
-def test_step7_startup_parser_accepts_unique_loopback_port_without_gpu_offload() -> None:
+def test_step7_startup_parser_accepts_b10007_loopback_port_without_gpu_offload() -> None:
     parser = llama_slice.LlamaStartupLogParser()
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
 
     startup = parser.finish(require_gpu_offload=False)
 
     assert startup.bound_port == 49_152
     assert startup.gpu_offload is None
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        ("main: server is listening on http://127.0.0.1:49152",),
+        (
+            "main: server is listening on http://127.0.0.1:49152",
+            "srv  llama_server: listening on http://127.0.0.1:49152",
+        ),
+    ],
+    ids=("legacy-only", "legacy-plus-b10007"),
+)
+def test_step7_startup_parser_rejects_legacy_listening_marker(
+    lines: tuple[str, ...],
+) -> None:
+    parser = llama_slice.LlamaStartupLogParser()
+
+    with pytest.raises(llama_slice.LlamaSliceStartupError, match=r"port|loopback|startup"):
+        for line in lines:
+            parser.feed_line(stream="stderr", line=line)
+        parser.finish(require_gpu_offload=False)
 
 
 def test_step7_startup_parser_accepts_unique_positive_gpu_offload() -> None:
@@ -6154,7 +6176,7 @@ def test_step7_startup_parser_accepts_unique_positive_gpu_offload() -> None:
     )
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:53211",
+        line="srv  llama_server: listening on http://127.0.0.1:53211",
     )
 
     startup = parser.finish(require_gpu_offload=True)
@@ -6169,13 +6191,13 @@ def test_step7_startup_parser_accepts_unique_positive_gpu_offload() -> None:
     "lines",
     [
         (
-            "main: server is listening on http://127.0.0.1:49152",
-            "main: server is listening on http://127.0.0.1:49152",
+            "srv  llama_server: listening on http://127.0.0.1:49152",
+            "srv  llama_server: listening on http://127.0.0.1:49152",
         ),
-        ("main: server is listening on http://0.0.0.0:49152",),
-        ("main: server is listening on http://localhost:49152",),
-        ("main: server is listening on http://127.0.0.1:0",),
-        ("main: server is listening on http://127.0.0.1:65536",),
+        ("srv  llama_server: listening on http://0.0.0.0:49152",),
+        ("srv  llama_server: listening on http://localhost:49152",),
+        ("srv  llama_server: listening on http://127.0.0.1:0",),
+        ("srv  llama_server: listening on http://127.0.0.1:65536",),
     ],
     ids=("duplicate", "wildcard", "hostname", "zero", "overflow"),
 )
@@ -6211,7 +6233,7 @@ def test_step7_startup_parser_rejects_zero_or_ambiguous_gpu_offload(
             parser.feed_line(stream="stderr", line=line)
         parser.feed_line(
             stream="stderr",
-            line="main: server is listening on http://127.0.0.1:49152",
+            line="srv  llama_server: listening on http://127.0.0.1:49152",
         )
         parser.finish(require_gpu_offload=True)
 
@@ -6582,9 +6604,9 @@ def test_step7_version_parser_does_not_leak_invalid_output_in_traceback() -> Non
 @pytest.mark.parametrize(
     "line",
     [
-        "prefix main: server is listening on http://127.0.0.1:49152",
-        "main: server is listening on http://127.0.0.1:49152 suffix",
-        "main: server is listening on http://127.0.0.1:049152",
+        "prefix srv  llama_server: listening on http://127.0.0.1:49152",
+        "srv  llama_server: listening on http://127.0.0.1:49152 suffix",
+        "srv  llama_server: listening on http://127.0.0.1:049152",
         "load_tensors: offloaded 037/37 layers to GPU",
         "load_tensors: offloaded 38/37 layers to GPU",
         "load_tensors: offloaded " + "9" * 5_000 + "/37 layers to GPU",
@@ -6607,7 +6629,7 @@ def test_step7_startup_parser_rejects_noncanonical_lines(line: str) -> None:
         parser.feed_line(stream="stderr", line=line)
         parser.feed_line(
             stream="stderr",
-            line="main: server is listening on http://127.0.0.1:49152",
+            line="srv  llama_server: listening on http://127.0.0.1:49152",
         )
         parser.finish(require_gpu_offload="offloaded" in line)
 
@@ -6662,7 +6684,7 @@ def test_step7_startup_parser_accepts_utf8_diagnostic_and_exact_line_limit() -> 
         parser.feed_line(stream="stderr", line="diagnostic")
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
 
     startup = parser.finish(require_gpu_offload=False)
@@ -6699,7 +6721,7 @@ def test_step7_startup_parser_rejects_noncanonical_offload_numbers(line: str) ->
     parser.feed_line(stream="stderr", line=line)
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
 
     with pytest.raises(llama_slice.LlamaSliceStartupError, match="offload"):
@@ -6710,7 +6732,7 @@ def test_step7_startup_parser_is_one_shot() -> None:
     parser = llama_slice.LlamaStartupLogParser()
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
     parser.finish(require_gpu_offload=False)
 
@@ -6723,7 +6745,7 @@ def test_step7_cpu_allows_one_zero_offload_but_rejects_ambiguity() -> None:
     parser.feed_line(stream="stderr", line="load_tensors: offloaded 0/37 layers to GPU")
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
 
     startup = parser.finish(require_gpu_offload=False)
@@ -6737,7 +6759,7 @@ def test_step7_cpu_allows_one_zero_offload_but_rejects_ambiguity() -> None:
         )
     ambiguous.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
     with pytest.raises(llama_slice.LlamaSliceStartupError, match="ambiguous"):
         ambiguous.finish(require_gpu_offload=False)
@@ -6748,7 +6770,7 @@ def test_step7_cpu_rejects_positive_gpu_offload() -> None:
     parser.feed_line(stream="stderr", line="load_tensors: offloaded 37/37 layers to GPU")
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
 
     with pytest.raises(llama_slice.LlamaSliceStartupError, match=r"CPU|offload"):
@@ -6759,7 +6781,7 @@ def test_step7_startup_parser_remains_failed_after_feed_error() -> None:
     parser = llama_slice.LlamaStartupLogParser()
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
     with pytest.raises(llama_slice.LlamaSliceStartupError):
         parser.feed_line(
@@ -6775,7 +6797,7 @@ def test_step7_invalid_finish_role_is_terminal() -> None:
     parser = llama_slice.LlamaStartupLogParser()
     parser.feed_line(
         stream="stderr",
-        line="main: server is listening on http://127.0.0.1:49152",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
     )
 
     with pytest.raises(llama_slice.LlamaSliceStartupError, match="role"):
@@ -6792,7 +6814,7 @@ def test_step7_builder_rejects_api_key_alternate_data_stream() -> None:
 
 
 _STEP7_HEALTH_LOADING_BODY = (
-    b'{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}'
+    b'{"error":{"message":"Loading model","type":"unavailable_error","code":503}}'
 )
 _STEP7_HEALTH_READY_BODY = b'{"status":"ok"}'
 
@@ -7214,7 +7236,7 @@ def test_step7_log_capture_frames_fragmented_utf8_crlf_and_unterminated_line() -
     raw = (
         "diagnóstico \u03b1\r\n".encode()
         + b"load_tensors: offloaded 37/37 layers to GPU\r\n"
-        + b"main: server is listening on http://127.0.0.1:49152"
+        + b"srv  llama_server: listening on http://127.0.0.1:49152"
     )
     split_points = (1, 13, 14, 15, len(raw) - 3)
     start = 0
@@ -7259,7 +7281,11 @@ def test_step7_log_capture_bounds_tail_but_hashes_entire_stream() -> None:
     diagnostic_lines = b"".join(
         f"diagnostic-{index:05d}-".encode() + b"x" * 80 + b"\n" for index in range(3_000)
     )
-    raw = diagnostic_lines + secret + b"\nmain: server is listening on http://127.0.0.1:49152\n"
+    raw = (
+        diagnostic_lines
+        + secret
+        + b"\nsrv  llama_server: listening on http://127.0.0.1:49152\n"
+    )
     source = _Step7LogSource(_step7_chunk_bytes(raw, llama_slice.LLAMA_LOG_READ_CHUNK_BYTES))
 
     outcome = llama_slice.drain_llama_log_source(
@@ -7404,7 +7430,7 @@ def test_step7_log_drain_does_not_mask_memory_error() -> None:
 def test_step7_log_capture_is_one_shot_and_rejects_invalid_arguments() -> None:
     router = llama_slice.LlamaStartupLineRouter()
     capture = llama_slice.LlamaLogCapture(stream="stdout", line_sink=router)
-    capture.feed(b"main: server is listening on http://127.0.0.1:49152\n")
+    capture.feed(b"srv  llama_server: listening on http://127.0.0.1:49152\n")
     capture.finish()
 
     with pytest.raises(llama_slice.LlamaSliceStartupError, match="finished"):
@@ -7423,7 +7449,9 @@ def test_step7_log_router_combines_streams_and_detects_cross_stream_ambiguity() 
     router = llama_slice.LlamaStartupLineRouter()
     stdout_outcome = llama_slice.drain_llama_log_source(
         stream="stdout",
-        source=_Step7LogSource([b"main: server is listening on http://127.0.0.1:49152\n"]),  # type: ignore[arg-type]
+        source=_Step7LogSource(
+            [b"srv  llama_server: listening on http://127.0.0.1:49152\n"]
+        ),  # type: ignore[arg-type]
         line_sink=router,
     )
     stderr_outcome = llama_slice.drain_llama_log_source(
@@ -7446,7 +7474,9 @@ def test_step7_log_router_combines_streams_and_detects_cross_stream_ambiguity() 
     for stream in ("stdout", "stderr"):
         ambiguous_outcomes[stream] = llama_slice.drain_llama_log_source(
             stream=stream,
-            source=_Step7LogSource([b"main: server is listening on http://127.0.0.1:49152\n"]),  # type: ignore[arg-type]
+            source=_Step7LogSource(
+                [b"srv  llama_server: listening on http://127.0.0.1:49152\n"]
+            ),  # type: ignore[arg-type]
             line_sink=ambiguous,
         )
     with pytest.raises(llama_slice.LlamaSliceStartupError, match="port"):
@@ -7472,7 +7502,7 @@ def test_step7_log_router_port_snapshot_is_nonfinal_until_both_streams_end() -> 
         stream="stdout",
         source=_InspectingSource(
             [
-                b"main: server is listening on http://127.0.0.1:49152\n",
+                b"srv  llama_server: listening on http://127.0.0.1:49152\n",
                 b"ordinary diagnostic after health polling started\n",
             ]
         ),  # type: ignore[arg-type]
@@ -7498,13 +7528,17 @@ def test_step7_log_router_snapshot_does_not_hide_late_cross_stream_ambiguity() -
     router = llama_slice.LlamaStartupLineRouter()
     stdout_outcome = llama_slice.drain_llama_log_source(
         stream="stdout",
-        source=_Step7LogSource([b"main: server is listening on http://127.0.0.1:49152\n"]),  # type: ignore[arg-type]
+        source=_Step7LogSource(
+            [b"srv  llama_server: listening on http://127.0.0.1:49152\n"]
+        ),  # type: ignore[arg-type]
         line_sink=router,
     )
     assert router.snapshot_bound_port() == 49_152
     stderr_outcome = llama_slice.drain_llama_log_source(
         stream="stderr",
-        source=_Step7LogSource([b"main: server is listening on http://127.0.0.1:53211\n"]),  # type: ignore[arg-type]
+        source=_Step7LogSource(
+            [b"srv  llama_server: listening on http://127.0.0.1:53211\n"]
+        ),  # type: ignore[arg-type]
         line_sink=router,
     )
 
@@ -7521,7 +7555,9 @@ def test_step7_startup_finalizer_rejects_one_bad_stream_even_if_other_has_port()
     router = llama_slice.LlamaStartupLineRouter()
     stdout_outcome = llama_slice.drain_llama_log_source(
         stream="stdout",
-        source=_Step7LogSource([b"main: server is listening on http://127.0.0.1:49152\n"]),  # type: ignore[arg-type]
+        source=_Step7LogSource(
+            [b"srv  llama_server: listening on http://127.0.0.1:49152\n"]
+        ),  # type: ignore[arg-type]
         line_sink=router,
     )
     stderr_outcome = llama_slice.drain_llama_log_source(
@@ -7551,7 +7587,9 @@ def test_step7_startup_finalizer_rejects_foreign_router_outcomes() -> None:
     live_router = llama_slice.LlamaStartupLineRouter()
     llama_slice.drain_llama_log_source(
         stream="stdout",
-        source=_Step7LogSource([b"main: server is listening on http://127.0.0.1:49152\n"]),  # type: ignore[arg-type]
+        source=_Step7LogSource(
+            [b"srv  llama_server: listening on http://127.0.0.1:49152\n"]
+        ),  # type: ignore[arg-type]
         line_sink=live_router,
     )
     llama_slice.drain_llama_log_source(
@@ -7586,7 +7624,7 @@ def test_step7_startup_finalizer_rejects_direct_pre_eof_capture_outcomes() -> No
     router = llama_slice.LlamaStartupLineRouter()
     stdout = llama_slice.LlamaLogCapture(stream="stdout", line_sink=router)
     stderr = llama_slice.LlamaLogCapture(stream="stderr", line_sink=router)
-    stdout.feed(b"main: server is listening on http://127.0.0.1:49152\n")
+    stdout.feed(b"srv  llama_server: listening on http://127.0.0.1:49152\n")
 
     with pytest.raises(llama_slice.LlamaSliceStartupError, match=r"log|startup"):
         llama_slice.finalize_llama_startup_evidence(
@@ -7600,7 +7638,7 @@ def test_step7_startup_finalizer_rejects_direct_pre_eof_capture_outcomes() -> No
 def test_step7_startup_finalizer_rejects_unbound_facts_with_sealed_empty_streams() -> None:
     router = llama_slice.LlamaStartupLineRouter()
     unbound = llama_slice.LlamaLogCapture(stream="stdout", line_sink=router)
-    unbound.feed(b"main: server is listening on http://127.0.0.1:49152\n")
+    unbound.feed(b"srv  llama_server: listening on http://127.0.0.1:49152\n")
     unbound.finish()
     stdout_outcome = llama_slice.drain_llama_log_source(
         stream="stdout",
@@ -7626,7 +7664,9 @@ def test_step7_startup_finalizer_rejects_swapped_stream_capabilities() -> None:
     router = llama_slice.LlamaStartupLineRouter()
     stdout_outcome = llama_slice.drain_llama_log_source(
         stream="stdout",
-        source=_Step7LogSource([b"main: server is listening on http://127.0.0.1:49152\n"]),  # type: ignore[arg-type]
+        source=_Step7LogSource(
+            [b"srv  llama_server: listening on http://127.0.0.1:49152\n"]
+        ),  # type: ignore[arg-type]
         line_sink=router,
     )
     stderr_outcome = llama_slice.drain_llama_log_source(
@@ -7649,7 +7689,7 @@ def test_step7_both_log_sources_drain_after_first_stream_semantic_failure() -> N
     stderr_source = _Step7LogSource([b"\xff\n", b"stderr-after-failure\n"])
     stdout_source = _Step7LogSource(
         [
-            b"main: server is listening on http://127.0.0.1:49152\n",
+            b"srv  llama_server: listening on http://127.0.0.1:49152\n",
             b"stdout-after-router-failure\n",
         ]
     )
@@ -7736,7 +7776,6 @@ def _step8_choice_event(
                 "delta": delta,
                 "finish_reason": finish_reason,
                 "index": 0,
-                "logprobs": None,
             }
         ],
         "created": created,
@@ -7925,6 +7964,21 @@ def test_step8_parser_accepts_exact_fragmented_stream_and_measures_client_time(
     assert clock.values == []
     assert stream.items == []
     assert all(size == llama_slice.LLAMA_SSE_READ_CHUNK_BYTES for size in stream.read_sizes)
+
+
+def test_step8_parser_ignores_exact_b10007_heartbeat_before_and_between_events() -> None:
+    events = _step8_valid_events()
+    raw = (
+        b":\n\n"
+        + _step8_sse_event(events[0])
+        + b":\n\n"
+        + b"".join(_step8_sse_event(event) for event in events[1:])
+        + b"data: [DONE]\n\n"
+    )
+
+    result = _step8_parse(raw)
+
+    assert result.content == _STEP8_CONTENT
 
 
 def test_step8_parser_counts_whitespace_as_first_nonempty_content() -> None:
@@ -8137,7 +8191,7 @@ def test_step8_json_depth_boundary_plus_one_is_rejected_before_envelope() -> Non
         "extra-choice-field",
         "bool-index",
         "wrong-index",
-        "nonnull-logprobs",
+        "legacy-logprobs-field",
         "nondict-delta",
         "wrong-role",
         "role-content-string",
@@ -8189,15 +8243,15 @@ def test_step8_parser_rejects_nonexact_envelope_or_event_order(case: str) -> Non
     elif case == "nonobject-choice":
         target["choices"] = ["choice"]
     elif case == "missing-choice-field":
-        choice.pop("logprobs")
+        choice.pop("finish_reason")
     elif case == "extra-choice-field":
         choice["secret"] = "SECRET-CHOICE-CANARY"
     elif case == "bool-index":
         choice["index"] = True
     elif case == "wrong-index":
         choice["index"] = 1
-    elif case == "nonnull-logprobs":
-        choice["logprobs"] = {}
+    elif case == "legacy-logprobs-field":
+        choice["logprobs"] = None
     elif case == "nondict-delta":
         choice["delta"] = []
     elif case == "wrong-role":
@@ -8828,7 +8882,7 @@ def test_step8_parser_accepts_equal_monotonic_first_and_done_times(
 @pytest.mark.parametrize("extra_node", [False, True], ids=("exact", "plus-one"))
 def test_step8_json_node_count_has_exact_boundary(extra_node: bool) -> None:
     payload = _step8_valid_events()[0]
-    base_node_count = 14
+    base_node_count = 13
     list_node_count = 1
     item_count = (
         llama_slice.MAX_LLAMA_SSE_JSON_NODES - base_node_count - list_node_count + int(extra_node)
@@ -10386,9 +10440,613 @@ class _Step9BlockingCancellationResponse(_Step8HttpResponse):
         super().close()
 
 
+def _step9_partial_data_line(
+    *,
+    content: str = " TEST",
+    token_ids: tuple[int, ...] = (123,),
+    tokens_evaluated: int = 64,
+    tokens_predicted: int = 1,
+) -> bytes:
+    payload = {
+        "content": content,
+        "id_slot": 0,
+        "index": 0,
+        "stop": False,
+        "tokens": list(token_ids),
+        "tokens_evaluated": tokens_evaluated,
+        "tokens_predicted": tokens_predicted,
+    }
+    return b"data: " + json.dumps(payload, separators=(",", ":")).encode()
+
+
 def _step9_completion_sse(*, content: str, stop: bool) -> bytes:
-    payload = {"content": content, "stop": stop, "tokens": [123]}
-    return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
+    assert stop is False
+    return _step9_partial_data_line(content=content) + b"\n\n"
+
+
+def _step9_b10007_generation_settings() -> dict[str, object]:
+    return {
+        "seed": 4_294_967_295,
+        "temperature": 0.8,
+        "dynatemp_range": 0.0,
+        "dynatemp_exponent": 1.0,
+        "top_k": 40,
+        "top_p": 0.95,
+        "min_p": 0.05,
+        "top_n_sigma": -1.0,
+        "xtc_probability": 0.0,
+        "xtc_threshold": 0.1,
+        "typical_p": 1.0,
+        "repeat_last_n": 64,
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "dry_multiplier": 0.0,
+        "dry_base": 1.75,
+        "dry_allowed_length": 2,
+        "dry_penalty_last_n": 4_096,
+        "dry_sequence_breakers": ["\n", ":", '"', "*"],
+        "mirostat": 0,
+        "mirostat_tau": 5.0,
+        "mirostat_eta": 0.1,
+        "stop": [],
+        "max_tokens": 1_024,
+        "n_predict": 1_024,
+        "n_keep": 0,
+        "n_discard": 0,
+        "ignore_eos": True,
+        "stream": True,
+        "logit_bias": [],
+        "n_probs": 0,
+        "min_keep": 0,
+        "grammar": "",
+        "grammar_lazy": False,
+        "grammar_triggers": [],
+        "preserved_tokens": [],
+        "chat_format": "Content-only",
+        "reasoning_format": "none",
+        "reasoning_in_content": False,
+        "generation_prompt": "",
+        "samplers": [
+            "penalties",
+            "dry",
+            "top_n_sigma",
+            "top_k",
+            "typ_p",
+            "top_p",
+            "min_p",
+            "xtc",
+            "temperature",
+        ],
+        "speculative.types": "none",
+        "timings_per_token": False,
+        "post_sampling_probs": False,
+        "backend_sampling": False,
+        "lora": [],
+    }
+
+
+def _step9_b10007_final_data_line(
+    *,
+    generation_settings: dict[str, object] | None = None,
+    tokens_cached: int = 1_087,
+    tokens_evaluated: int = 64,
+    tokens_predicted: int = 1_024,
+) -> bytes:
+    payload = {
+        "index": 0,
+        "content": "",
+        "tokens": [],
+        "id_slot": 0,
+        "stop": True,
+        "model": "local-academic",
+        "tokens_predicted": tokens_predicted,
+        "tokens_evaluated": tokens_evaluated,
+        "generation_settings": (
+            _step9_b10007_generation_settings()
+            if generation_settings is None
+            else generation_settings
+        ),
+        "prompt": (
+            "Continue by outputting the token TEST separated by one space until stopped."
+        ),
+        "has_new_line": False,
+        "truncated": False,
+        "stop_type": "limit",
+        "stopping_word": "",
+        "tokens_cached": tokens_cached,
+        "timings": {
+            "cache_n": 0,
+            "prompt_n": tokens_evaluated,
+            "prompt_ms": 100.0,
+            "prompt_per_token_ms": 1.5625,
+            "prompt_per_second": 640.0,
+            "predicted_n": tokens_predicted,
+            "predicted_ms": 25.0 * tokens_predicted,
+            "predicted_per_token_ms": 25.0,
+            "predicted_per_second": 40.0,
+        },
+    }
+    return b"data: " + json.dumps(payload, separators=(",", ":")).encode()
+
+
+def test_step9_cancellation_detector_accepts_exact_b10007_partial_event() -> None:
+    first_content = threading.Event()
+    state_changed = threading.Event()
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=first_content,
+        state_changed_event=state_changed,
+    )
+    detector.feed_line(
+        b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
+        b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+    )
+
+    detector.feed_line(b"")
+
+    assert detector.first_content_observed
+    assert first_content.is_set()
+    assert state_changed.is_set()
+    assert not detector.completed
+
+
+def test_step9_cancellation_detector_accepts_b10007_heartbeats_before_between_and_consecutive() -> (
+    None
+):
+    first_content = threading.Event()
+    state_changed = threading.Event()
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=first_content,
+        state_changed_event=state_changed,
+    )
+
+    for raw_line in (
+        b":",
+        b"",
+        b":",
+        b"",
+        (
+            b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
+            b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+        ),
+        b"",
+        b":",
+        b"",
+        (
+            b'data: {"index":0,"content":" TEST","tokens":[124],"stop":false,'
+            b'"id_slot":0,"tokens_predicted":2,"tokens_evaluated":64}'
+        ),
+        b"",
+    ):
+        detector.feed_line(raw_line)
+
+    assert detector.event_count == 5
+    assert detector.first_content_observed
+    assert first_content.is_set()
+    assert state_changed.is_set()
+    assert not detector.completed
+
+
+@pytest.mark.parametrize(
+    "raw_lines",
+    [
+        (b": keep-alive",),
+        (
+            b":",
+            (
+                b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
+                b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+            ),
+        ),
+        (
+            (
+                b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
+                b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+            ),
+            b":",
+        ),
+        (b":", b":"),
+    ],
+    ids=(
+        "nonexact-comment",
+        "data-inside-comment",
+        "comment-inside-data",
+        "comment-inside-comment",
+    ),
+)
+def test_step9_cancellation_detector_rejects_malformed_or_nested_heartbeat(
+    raw_lines: tuple[bytes, ...],
+) -> None:
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+
+    with pytest.raises(ValueError, match="cancellation SSE"):
+        for raw_line in raw_lines:
+            detector.feed_line(raw_line)
+
+
+def test_step9_cancellation_detector_counts_heartbeat_toward_event_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llama_slice, "MAX_LLAMA_SSE_EVENTS", 1)
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(b":")
+    detector.feed_line(b"")
+    detector.feed_line(
+        b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
+        b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+    )
+
+    with pytest.raises(ValueError, match="event count"):
+        detector.feed_line(b"")
+
+
+@pytest.mark.parametrize(
+    "partial_lines",
+    [
+        (_step9_partial_data_line(tokens_predicted=0),),
+        (
+            _step9_partial_data_line(tokens_predicted=1),
+            _step9_partial_data_line(token_ids=(124,), tokens_predicted=1),
+        ),
+        (
+            _step9_partial_data_line(tokens_predicted=1),
+            _step9_partial_data_line(token_ids=(124,), tokens_predicted=2),
+            _step9_partial_data_line(token_ids=(125,), tokens_predicted=1),
+        ),
+        (
+            _step9_partial_data_line(tokens_predicted=1),
+            _step9_partial_data_line(
+                token_ids=(124,),
+                tokens_evaluated=65,
+                tokens_predicted=2,
+            ),
+        ),
+        (
+            _step9_partial_data_line(
+                content="",
+                token_ids=(),
+                tokens_predicted=1,
+            ),
+        ),
+    ],
+    ids=(
+        "zero",
+        "repeat",
+        "decrease",
+        "evaluated-change",
+        "missing-token",
+    ),
+)
+def test_step9_cancellation_detector_rejects_invalid_partial_counter_state(
+    partial_lines: tuple[bytes, ...],
+) -> None:
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+
+    with pytest.raises(ValueError, match=r"partial|counter"):
+        for partial_line in partial_lines:
+            detector.feed_line(partial_line)
+            detector.feed_line(b"")
+
+
+@pytest.mark.parametrize(
+    "tokens_predicted",
+    [(2,), (1, 3)],
+    ids=("suppressed-first-token", "suppressed-intermediate-token"),
+)
+def test_step9_cancellation_detector_accepts_strictly_increasing_partial_counters(
+    tokens_predicted: tuple[int, ...],
+) -> None:
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    for offset, predicted_count in enumerate(tokens_predicted):
+        detector.feed_line(
+            _step9_partial_data_line(
+                token_ids=(123 + offset,),
+                tokens_predicted=predicted_count,
+            )
+        )
+        detector.feed_line(b"")
+
+    assert detector.partial_tokens_predicted == tokens_predicted[-1]
+    assert detector.partial_tokens_evaluated == 64
+    assert not detector.completed
+
+
+def test_step9_cancellation_detector_accepts_final_after_lower_partial_counter() -> None:
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(_step9_partial_data_line(tokens_predicted=1))
+    detector.feed_line(b"")
+    detector.feed_line(_step9_b10007_final_data_line())
+
+    detector.feed_line(b"")
+
+    assert detector.completed
+
+
+def test_step9_cancellation_detector_accepts_final_equal_to_last_partial_counter() -> (
+    None
+):
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    for tokens_predicted in range(1, 1_025):
+        detector.feed_line(
+            _step9_partial_data_line(tokens_predicted=tokens_predicted)
+        )
+        detector.feed_line(b"")
+    detector.feed_line(_step9_b10007_final_data_line())
+
+    detector.feed_line(b"")
+
+    assert detector.completed
+
+
+def test_step9_cancellation_detector_rejects_final_evaluated_mismatch_after_partial() -> (
+    None
+):
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    for tokens_predicted in range(1, 1_025):
+        detector.feed_line(
+            _step9_partial_data_line(tokens_predicted=tokens_predicted)
+        )
+        detector.feed_line(b"")
+    detector.feed_line(
+        _step9_b10007_final_data_line(
+            tokens_cached=1_088,
+            tokens_evaluated=65,
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"final.*counter"):
+        detector.feed_line(b"")
+
+
+def test_step9_cancellation_detector_accepts_source_shaped_b10007_final_settings() -> (
+    None
+):
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(_step9_b10007_final_data_line())
+
+    detector.feed_line(b"")
+
+    assert detector.completed
+    assert detector.event_count == 1
+    assert not detector.first_content_observed
+
+
+@pytest.mark.parametrize(
+    ("tokens_cached", "tokens_predicted"),
+    [(64, 1), (1_086, 1_024)],
+    ids=("early-limit", "cached-mismatch"),
+)
+def test_step9_cancellation_detector_rejects_nonexact_final_limit_semantics(
+    tokens_cached: int,
+    tokens_predicted: int,
+) -> None:
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(
+        _step9_b10007_final_data_line(
+            tokens_cached=tokens_cached,
+            tokens_predicted=tokens_predicted,
+        )
+    )
+
+    with pytest.raises(ValueError, match="final"):
+        detector.feed_line(b"")
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_step9_cancellation_detector_rejects_nonexact_b10007_final_setting_fields(
+    mutation: str,
+) -> None:
+    settings = _step9_b10007_generation_settings()
+    if mutation == "missing":
+        settings.pop("seed")
+    else:
+        settings["extra"] = 0
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(
+        _step9_b10007_final_data_line(generation_settings=settings)
+    )
+
+    with pytest.raises(ValueError, match="settings"):
+        detector.feed_line(b"")
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("max_tokens", True),
+        ("max_tokens", 1_023),
+        ("n_predict", True),
+        ("n_predict", 1_023),
+        ("ignore_eos", 1),
+        ("ignore_eos", False),
+        ("stream", 1),
+        ("stream", False),
+        ("n_probs", False),
+        ("n_probs", 1),
+        ("timings_per_token", 0),
+        ("timings_per_token", True),
+        ("post_sampling_probs", 0),
+        ("post_sampling_probs", True),
+    ],
+    ids=(
+        "max-tokens-type",
+        "max-tokens-value",
+        "n-predict-type",
+        "n-predict-value",
+        "ignore-eos-type",
+        "ignore-eos-value",
+        "stream-type",
+        "stream-value",
+        "n-probs-type",
+        "n-probs-value",
+        "timings-per-token-type",
+        "timings-per-token-value",
+        "post-sampling-probs-type",
+        "post-sampling-probs-value",
+    ),
+)
+def test_step9_cancellation_detector_rejects_wrong_fixed_b10007_final_setting(
+    field: str,
+    invalid_value: object,
+) -> None:
+    settings = _step9_b10007_generation_settings()
+    settings[field] = invalid_value
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(
+        _step9_b10007_final_data_line(generation_settings=settings)
+    )
+
+    with pytest.raises(ValueError, match="settings"):
+        detector.feed_line(b"")
+
+
+_STEP9_INVALID_GENERATION_SETTING_SHAPES: tuple[tuple[str, object], ...] = (
+    ("seed", {}),
+    ("temperature", "0.8"),
+    ("dynatemp_range", None),
+    ("dynatemp_exponent", False),
+    ("top_k", 40.0),
+    ("top_p", {}),
+    ("min_p", "0.05"),
+    ("top_n_sigma", []),
+    ("xtc_probability", True),
+    ("xtc_threshold", None),
+    ("typical_p", "1.0"),
+    ("repeat_last_n", 64.0),
+    ("repeat_penalty", "1.0"),
+    ("presence_penalty", []),
+    ("frequency_penalty", {}),
+    ("dry_multiplier", False),
+    ("dry_base", "1.75"),
+    ("dry_allowed_length", 2.0),
+    ("dry_penalty_last_n", "4096"),
+    ("dry_sequence_breakers", ["\n", 1, '"', "*"]),
+    ("mirostat", 0.0),
+    ("mirostat_tau", "5.0"),
+    ("mirostat_eta", []),
+    ("stop", ["BAD"]),
+    ("max_tokens", 1_023),
+    ("n_predict", 1_023),
+    ("n_keep", 0.0),
+    ("n_discard", False),
+    ("ignore_eos", False),
+    ("stream", False),
+    ("logit_bias", [{"token": 1, "bias": 0.0}]),
+    ("n_probs", 1),
+    ("min_keep", 0.0),
+    ("grammar", "x"),
+    ("grammar_lazy", True),
+    ("grammar_triggers", [{}]),
+    ("preserved_tokens", [1]),
+    ("chat_format", "OpenAI"),
+    ("reasoning_format", "deepseek"),
+    ("reasoning_in_content", True),
+    ("generation_prompt", "x"),
+    ("samplers", "penalties"),
+    ("speculative.types", "draft"),
+    ("timings_per_token", True),
+    ("post_sampling_probs", True),
+    ("backend_sampling", True),
+    ("lora", [{"id": "bad", "scale": "bad"}]),
+)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    _STEP9_INVALID_GENERATION_SETTING_SHAPES,
+    ids=[field for field, _ in _STEP9_INVALID_GENERATION_SETTING_SHAPES],
+)
+def test_step9_cancellation_detector_rejects_invalid_shape_for_every_final_setting(
+    field: str,
+    invalid_value: object,
+) -> None:
+    settings = _step9_b10007_generation_settings()
+    settings[field] = invalid_value
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(
+        _step9_b10007_final_data_line(generation_settings=settings)
+    )
+
+    with pytest.raises(ValueError, match="settings"):
+        detector.feed_line(b"")
+
+
+def test_step9_cancellation_detector_rejects_wrong_sampler_member_type() -> None:
+    settings = _step9_b10007_generation_settings()
+    settings["samplers"] = [
+        "penalties",
+        "dry",
+        "top_n_sigma",
+        "top_k",
+        "typ_p",
+        "top_p",
+        "min_p",
+        "xtc",
+        1,
+    ]
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(
+        _step9_b10007_final_data_line(generation_settings=settings)
+    )
+
+    with pytest.raises(ValueError, match="settings"):
+        detector.feed_line(b"")
+
+
+def test_step9_cancellation_detector_rejects_nonfinite_numeric_setting() -> None:
+    settings = _step9_b10007_generation_settings()
+    settings["temperature"] = math.inf
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(
+        _step9_b10007_final_data_line(generation_settings=settings)
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceResponseError) as raised:
+        detector.feed_line(b"")
+
+    assert raised.value.code == "invalid_json"
 
 
 def _step9_json_response(path: str, body: bytes) -> _Step8HttpResponse:
@@ -10531,9 +11189,10 @@ def test_step9_disconnect_cancellation_reader_start_cleanup_failure_is_terminal(
 
 
 def test_step9_disconnect_cancellation_rejects_normal_completion_before_signal() -> None:
+    final_event = _step9_b10007_final_data_line() + b"\n\n"
     response = _Step8HttpResponse(
         url="http://127.0.0.1:49152/completion",
-        items=[_step9_completion_sse(content=" TEST", stop=True)],
+        items=[final_event],
     )
     client = _Step8HttpClient([response])
     factory = _Step8HttpClientFactory([client])
@@ -11051,12 +11710,35 @@ def test_step9_disconnect_cancellation_reader_deadlock_is_terminal(
 @pytest.mark.parametrize(
     "raw",
     [
-        b'data: {"content":"SECRET-CANCEL-RAW","stop":false,"tokens":[1],"extra":0}\n\n',
-        b'data: {"content":"SECRET-CANCEL-RAW","content":"x","stop":false,"tokens":[1]}\n\n',
-        b'data: {"content":"SECRET-CANCEL-RAW","stop":false,"tokens":[1]}\r\n\n',
-        b'data: {"content":"SECRET-CANCEL-RAW","stop":false,"tokens":[true]}\n\n',
+        (
+            b'data: {"index":0,"content":"SECRET-CANCEL-RAW","tokens":[1],'
+            b'"stop":false,"id_slot":0,"tokens_predicted":1,'
+            b'"tokens_evaluated":64,"extra":0}\n\n'
+        ),
+        (
+            b'data: {"index":0,"content":"SECRET-CANCEL-RAW","content":"x",'
+            b'"tokens":[1],"stop":false,"id_slot":0,"tokens_predicted":1,'
+            b'"tokens_evaluated":64}\n\n'
+        ),
+        (
+            b'data: {"index":0,"content":"SECRET-CANCEL-RAW","tokens":[1],'
+            b'"stop":false,"id_slot":0,"tokens_predicted":1,'
+            b'"tokens_evaluated":64}\r\n\n'
+        ),
+        (
+            b'data: {"index":0,"content":"SECRET-CANCEL-RAW","tokens":[true],'
+            b'"stop":false,"id_slot":0,"tokens_predicted":1,'
+            b'"tokens_evaluated":64}\n\n'
+        ),
+        b":\n",
     ],
-    ids=("extra-field", "duplicate-key", "mixed-newline", "bool-token"),
+    ids=(
+        "extra-field",
+        "duplicate-key",
+        "mixed-newline",
+        "bool-token",
+        "unterminated-heartbeat",
+    ),
 )
 def test_step9_disconnect_cancellation_rejects_malformed_stream_without_leakage(
     raw: bytes,
@@ -13163,7 +13845,7 @@ class _Step10PipeReaderApi(_Step10AtomicApi):
 
 
 def test_step10_pipe_readers_start_exactly_two_and_seal_router_outcomes() -> None:
-    stdout = b"main: server is listening on http://127.0.0.1:49152\n"
+    stdout = b"srv  llama_server: listening on http://127.0.0.1:49152\n"
     stderr = b"ordinary diagnostic\n"
     api = _Step10PipeReaderApi(
         stdout_items=[stdout, b""],
@@ -15603,7 +16285,7 @@ class _Step10StartupSessionApi(_Step10PipeReaderApi):
         if handle == 103 and self.stdout_first_read and self.port is not None:
             self.stdout_first_read = False
             return (
-                f"main: server is listening on http://127.0.0.1:{self.port}\n"
+                f"srv  llama_server: listening on http://127.0.0.1:{self.port}\n"
                 f"{self.startup_stdout_suffix}"
             ).encode("ascii")
         if not self.reader_release.wait(2.0):
@@ -16796,7 +17478,7 @@ def test_step10_windows_startup_preserves_reader_memory_during_final_acceptance(
             self.reader_started[stream].set()
             if handle == 103 and self.stdout_first_read:
                 self.stdout_first_read = False
-                return b"main: server is listening on http://127.0.0.1:49152\n"
+                return b"srv  llama_server: listening on http://127.0.0.1:49152\n"
             if handle == 103:
                 assert self.fail_stdout.wait(2.0)
                 raise marker

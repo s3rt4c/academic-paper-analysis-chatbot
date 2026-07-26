@@ -201,13 +201,121 @@ CITED_ANSWER_USER_MESSAGE = (
     "Return the required JSON object."
 )
 LLAMA_HEALTH_LOADING_BODY = (
-    b'{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}'
+    b'{"error":{"message":"Loading model","type":"unavailable_error","code":503}}'
 )
 LLAMA_HEALTH_READY_BODY = b'{"status":"ok"}'
 LLAMA_CANCELLATION_PROMPT = (
     "Continue by outputting the token TEST separated by one space until stopped."
 )
 LLAMA_CANCELLATION_RECOVERY_PROMPT = "Output the token TEST once."
+_LLAMA_CANCELLATION_GENERATION_SETTING_FIELDS = frozenset(
+    {
+        "backend_sampling",
+        "chat_format",
+        "dry_allowed_length",
+        "dry_base",
+        "dry_multiplier",
+        "dry_penalty_last_n",
+        "dry_sequence_breakers",
+        "dynatemp_exponent",
+        "dynatemp_range",
+        "frequency_penalty",
+        "generation_prompt",
+        "grammar",
+        "grammar_lazy",
+        "grammar_triggers",
+        "ignore_eos",
+        "logit_bias",
+        "lora",
+        "max_tokens",
+        "min_keep",
+        "min_p",
+        "mirostat",
+        "mirostat_eta",
+        "mirostat_tau",
+        "n_discard",
+        "n_keep",
+        "n_predict",
+        "n_probs",
+        "post_sampling_probs",
+        "presence_penalty",
+        "preserved_tokens",
+        "reasoning_format",
+        "reasoning_in_content",
+        "repeat_last_n",
+        "repeat_penalty",
+        "samplers",
+        "seed",
+        "speculative.types",
+        "stop",
+        "stream",
+        "temperature",
+        "timings_per_token",
+        "top_k",
+        "top_n_sigma",
+        "top_p",
+        "typical_p",
+        "xtc_probability",
+        "xtc_threshold",
+    }
+)
+_LLAMA_CANCELLATION_GENERATION_INTEGER_FIELDS = frozenset(
+    {
+        "dry_allowed_length",
+        "dry_penalty_last_n",
+        "max_tokens",
+        "min_keep",
+        "mirostat",
+        "n_discard",
+        "n_keep",
+        "n_predict",
+        "n_probs",
+        "repeat_last_n",
+        "seed",
+        "top_k",
+    }
+)
+_LLAMA_CANCELLATION_GENERATION_NUMBER_FIELDS = frozenset(
+    {
+        "dry_base",
+        "dry_multiplier",
+        "dynatemp_exponent",
+        "dynatemp_range",
+        "frequency_penalty",
+        "min_p",
+        "mirostat_eta",
+        "mirostat_tau",
+        "presence_penalty",
+        "repeat_penalty",
+        "temperature",
+        "top_n_sigma",
+        "top_p",
+        "typical_p",
+        "xtc_probability",
+        "xtc_threshold",
+    }
+)
+_LLAMA_CANCELLATION_EMPTY_GENERATION_LIST_FIELDS = frozenset(
+    {
+        "grammar_triggers",
+        "logit_bias",
+        "lora",
+        "preserved_tokens",
+        "stop",
+    }
+)
+_LLAMA_CANCELLATION_DRY_SEQUENCE_BREAKERS = ("\n", ":", '"', "*")
+_LLAMA_CANCELLATION_SAMPLERS = (
+    "penalties",
+    "dry",
+    "top_n_sigma",
+    "top_k",
+    "typ_p",
+    "top_p",
+    "min_p",
+    "xtc",
+    "temperature",
+)
 
 _APACHE_2_LICENSE_URL = "https://www.apache.org/licenses/LICENSE-2.0"
 _CHAT_PROFILE_ID = "qwen3-nonthinking-v1"
@@ -12349,7 +12457,7 @@ def parse_llama_server_version(output: bytes) -> LlamaServerVersion:
 
 
 _LLAMA_BOUND_PORT_LINE_PATTERN = re.compile(
-    r"main: server is listening on http://127\.0\.0\.1:([1-9][0-9]{0,4})\Z",
+    r"srv  llama_server: listening on http://127\.0\.0\.1:([1-9][0-9]{0,4})\Z",
     re.ASCII,
 )
 _LLAMA_GPU_OFFLOAD_LINE_PATTERN = re.compile(
@@ -12436,7 +12544,7 @@ class LlamaStartupLogParser:
             self._fail("Llama startup log exceeds the frozen line limit.")
         self._line_count += 1
 
-        if "server is listening on" in line:
+        if "llama_server: listening on" in line or "server is listening on" in line:
             port_match = _LLAMA_BOUND_PORT_LINE_PATTERN.fullmatch(line)
             if port_match is None:
                 self._invalid_port_marker = True
@@ -13784,12 +13892,11 @@ class _LlamaChatSseState:
             if type(choice) is not dict:
                 raise ValueError("choice is not an object")
             choice_payload = cast(dict[str, object], choice)
-            if set(choice_payload) != {"delta", "finish_reason", "index", "logprobs"}:
+            if set(choice_payload) != {"delta", "finish_reason", "index"}:
                 raise ValueError("choice fields are not exact")
             if (
                 type(choice_payload["index"]) is not int
                 or choice_payload["index"] != 0
-                or choice_payload["logprobs"] is not None
                 or type(choice_payload["delta"]) is not dict
             ):
                 raise ValueError("choice identity is not valid")
@@ -13904,6 +14011,7 @@ class _LlamaChatSseState:
 class _LlamaSseFramer:
     state: _LlamaChatSseState
     newline_mode: Literal["crlf", "lf"] | None = None
+    pending_comment: bool = False
     pending_data: bytes | None = None
     event_count: int = 0
 
@@ -13922,11 +14030,26 @@ class _LlamaSseFramer:
         if self.state.done_ns is not None:
             _raise_llama_response_error("invalid_sse")
         if line:
-            if self.pending_data is not None or not line.startswith(b"data: "):
+            if line == b":":
+                if self.pending_comment or self.pending_data is not None:
+                    _raise_llama_response_error("invalid_sse")
+                self.pending_comment = True
+                return
+            if (
+                self.pending_comment
+                or self.pending_data is not None
+                or not line.startswith(b"data: ")
+            ):
                 _raise_llama_response_error("invalid_sse")
             self.pending_data = line.removeprefix(b"data: ")
             if not self.pending_data:
                 _raise_llama_response_error("invalid_sse")
+            return
+        if self.pending_comment:
+            self.event_count += 1
+            if self.event_count > MAX_LLAMA_SSE_EVENTS:
+                _raise_llama_response_error("response_too_large")
+            self.pending_comment = False
             return
         if self.pending_data is None:
             _raise_llama_response_error("invalid_sse")
@@ -13942,7 +14065,11 @@ class _LlamaSseFramer:
             if b"\r" in remaining:
                 _raise_llama_response_error("invalid_sse")
             _raise_llama_response_error("incomplete_response")
-        if self.pending_data is not None or self.state.done_ns is None:
+        if (
+            self.pending_comment
+            or self.pending_data is not None
+            or self.state.done_ns is None
+        ):
             _raise_llama_response_error("incomplete_response")
         return self.state.build_result()
 
@@ -15228,6 +15355,63 @@ def _llama_cancellation_recovery_request_body() -> bytes:
     )
 
 
+def _validate_llama_cancellation_generation_settings(
+    payload: dict[str, object],
+) -> None:
+    if set(payload) != _LLAMA_CANCELLATION_GENERATION_SETTING_FIELDS:
+        raise ValueError("cancellation SSE final settings are invalid")
+    invalid = any(
+        type(payload[setting_name]) is not int
+        for setting_name in _LLAMA_CANCELLATION_GENERATION_INTEGER_FIELDS
+    )
+    for setting_name in _LLAMA_CANCELLATION_GENERATION_NUMBER_FIELDS:
+        value = payload[setting_name]
+        if type(value) is float:
+            invalid = invalid or not math.isfinite(value)
+        elif type(value) is not int:
+            invalid = True
+    invalid = invalid or any(
+        type(payload[setting_name]) is not list
+        or bool(cast(list[object], payload[setting_name]))
+        for setting_name in _LLAMA_CANCELLATION_EMPTY_GENERATION_LIST_FIELDS
+    )
+    dry_sequence_breakers = payload["dry_sequence_breakers"]
+    samplers = payload["samplers"]
+    invalid = (
+        invalid
+        or type(dry_sequence_breakers) is not list
+        or tuple(cast(list[object], dry_sequence_breakers))
+        != _LLAMA_CANCELLATION_DRY_SEQUENCE_BREAKERS
+        or type(samplers) is not list
+        or tuple(cast(list[object], samplers)) != _LLAMA_CANCELLATION_SAMPLERS
+        or type(payload["grammar"]) is not str
+        or payload["grammar"] != ""
+        or payload["grammar_lazy"] is not False
+        or type(payload["chat_format"]) is not str
+        or payload["chat_format"] != "Content-only"
+        or type(payload["reasoning_format"]) is not str
+        or payload["reasoning_format"] != "none"
+        or payload["reasoning_in_content"] is not False
+        or type(payload["generation_prompt"]) is not str
+        or payload["generation_prompt"] != ""
+        or type(payload["speculative.types"]) is not str
+        or payload["speculative.types"] != "none"
+        or payload["backend_sampling"] is not False
+        or type(payload["max_tokens"]) is not int
+        or payload["max_tokens"] != 1_024
+        or type(payload["n_predict"]) is not int
+        or payload["n_predict"] != 1_024
+        or payload["ignore_eos"] is not True
+        or payload["stream"] is not True
+        or type(payload["n_probs"]) is not int
+        or payload["n_probs"] != 0
+        or payload["timings_per_token"] is not False
+        or payload["post_sampling_probs"] is not False
+    )
+    if invalid:
+        raise ValueError("cancellation SSE final settings are invalid")
+
+
 type _LlamaCancellationReaderKind = Literal["cancelled", "completed", "invalid"]
 
 
@@ -15251,8 +15435,11 @@ class _LlamaCancellationSseDetector:
     first_content_event: threading.Event
     state_changed_event: threading.Event
     newline_mode: Literal["crlf", "lf"] | None = None
+    pending_comment: bool = False
     pending_data: bytes | None = None
     event_count: int = 0
+    partial_tokens_evaluated: int = 0
+    partial_tokens_predicted: int = 0
     first_content_observed: bool = False
     completed: bool = False
 
@@ -15269,11 +15456,26 @@ class _LlamaCancellationSseDetector:
         elif self.newline_mode != observed_mode:
             raise ValueError("cancellation SSE line endings changed")
         if line:
-            if self.pending_data is not None or not line.startswith(b"data: "):
+            if line == b":":
+                if self.pending_comment or self.pending_data is not None:
+                    raise ValueError("cancellation SSE comment state is invalid")
+                self.pending_comment = True
+                return
+            if (
+                self.pending_comment
+                or self.pending_data is not None
+                or not line.startswith(b"data: ")
+            ):
                 raise ValueError("cancellation SSE data line is invalid")
             self.pending_data = line.removeprefix(b"data: ")
             if not self.pending_data:
                 raise ValueError("cancellation SSE data is empty")
+            return
+        if self.pending_comment:
+            self.pending_comment = False
+            self.event_count += 1
+            if self.event_count > MAX_LLAMA_SSE_EVENTS:
+                raise ValueError("cancellation SSE event count exceeds its bound")
             return
         if self.pending_data is None:
             raise ValueError("cancellation SSE event is empty")
@@ -15283,23 +15485,163 @@ class _LlamaCancellationSseDetector:
         raw = self.pending_data
         self.pending_data = None
         payload = _decode_llama_sse_json_event(raw)
-        if set(payload) != {"content", "stop", "tokens"}:
+        payload_fields = set(payload)
+        partial_fields = {
+            "content",
+            "id_slot",
+            "index",
+            "stop",
+            "tokens",
+            "tokens_evaluated",
+            "tokens_predicted",
+        }
+        final_fields = {
+            "content",
+            "generation_settings",
+            "has_new_line",
+            "id_slot",
+            "index",
+            "model",
+            "prompt",
+            "stop",
+            "stop_type",
+            "stopping_word",
+            "timings",
+            "tokens",
+            "tokens_cached",
+            "tokens_evaluated",
+            "tokens_predicted",
+            "truncated",
+        }
+        completed = False
+        if payload_fields == partial_fields:
+            content = payload["content"]
+            id_slot = payload["id_slot"]
+            index = payload["index"]
+            stop = payload["stop"]
+            tokens = payload["tokens"]
+            tokens_evaluated = payload["tokens_evaluated"]
+            tokens_predicted = payload["tokens_predicted"]
+            if (
+                type(content) is not str
+                or type(id_slot) is not int
+                or id_slot != 0
+                or type(index) is not int
+                or index != 0
+                or stop is not False
+                or type(tokens) is not list
+                or len(tokens) != 1
+                or any(
+                    type(token) is not int or not 0 <= token <= 2_147_483_647
+                    for token in tokens
+                )
+                or type(tokens_evaluated) is not int
+                or not 1 <= tokens_evaluated <= MAX_LLAMA_CONTEXT_TOKENS
+                or (
+                    self.partial_tokens_evaluated != 0
+                    and tokens_evaluated != self.partial_tokens_evaluated
+                )
+                or type(tokens_predicted) is not int
+                or tokens_predicted <= self.partial_tokens_predicted
+                or tokens_predicted > MAX_LLAMA_COMPLETION_TOKENS
+            ):
+                raise ValueError("cancellation SSE partial values are invalid")
+            if self.partial_tokens_evaluated == 0:
+                self.partial_tokens_evaluated = tokens_evaluated
+            self.partial_tokens_predicted = tokens_predicted
+        elif payload_fields == final_fields:
+            content = payload["content"]
+            generation_settings = payload["generation_settings"]
+            timings = payload["timings"]
+            tokens_cached = payload["tokens_cached"]
+            tokens_evaluated = payload["tokens_evaluated"]
+            tokens_predicted = payload["tokens_predicted"]
+            if (
+                type(content) is not str
+                or content != ""
+                or type(payload["tokens"]) is not list
+                or payload["tokens"] != []
+                or type(payload["id_slot"]) is not int
+                or payload["id_slot"] != 0
+                or type(payload["index"]) is not int
+                or payload["index"] != 0
+                or payload["stop"] is not True
+                or type(payload["model"]) is not str
+                or payload["model"] != "local-academic"
+                or type(tokens_predicted) is not int
+                or tokens_predicted != 1_024
+                or type(tokens_evaluated) is not int
+                or not 1 <= tokens_evaluated <= MAX_LLAMA_CONTEXT_TOKENS
+                or type(payload["prompt"]) is not str
+                or payload["prompt"] != LLAMA_CANCELLATION_PROMPT
+                or type(payload["has_new_line"]) is not bool
+                or payload["truncated"] is not False
+                or payload["stop_type"] != "limit"
+                or type(payload["stopping_word"]) is not str
+                or payload["stopping_word"] != ""
+                or type(tokens_cached) is not int
+                or tokens_cached != tokens_evaluated + tokens_predicted - 1
+                or type(generation_settings) is not dict
+                or type(timings) is not dict
+            ):
+                raise ValueError("cancellation SSE final values are invalid")
+            settings_payload = cast(dict[str, object], generation_settings)
+            _validate_llama_cancellation_generation_settings(settings_payload)
+            timings_payload = cast(dict[str, object], timings)
+            if set(timings_payload) != {
+                "cache_n",
+                "predicted_ms",
+                "predicted_n",
+                "predicted_per_second",
+                "predicted_per_token_ms",
+                "prompt_ms",
+                "prompt_n",
+                "prompt_per_second",
+                "prompt_per_token_ms",
+            }:
+                raise ValueError("cancellation SSE final timing fields are invalid")
+            cache_n = _require_llama_exact_int(
+                timings_payload["cache_n"],
+                minimum=0,
+                maximum=MAX_LLAMA_CONTEXT_TOKENS,
+            )
+            prompt_n = _require_llama_exact_int(
+                timings_payload["prompt_n"],
+                minimum=1,
+                maximum=MAX_LLAMA_CONTEXT_TOKENS,
+            )
+            predicted_n = _require_llama_exact_int(
+                timings_payload["predicted_n"],
+                minimum=1,
+                maximum=MAX_LLAMA_COMPLETION_TOKENS,
+            )
+            for timing_name in (
+                "predicted_ms",
+                "predicted_per_second",
+                "predicted_per_token_ms",
+                "prompt_ms",
+                "prompt_per_second",
+                "prompt_per_token_ms",
+            ):
+                _require_llama_positive_number(timings_payload[timing_name])
+            if (
+                prompt_n + cache_n != tokens_evaluated
+                or predicted_n != tokens_predicted
+            ):
+                raise ValueError("cancellation SSE final timing counts are invalid")
+            if self.partial_tokens_predicted != 0 and (
+                tokens_predicted < self.partial_tokens_predicted
+                or tokens_evaluated != self.partial_tokens_evaluated
+            ):
+                raise ValueError("cancellation SSE final counters are invalid")
+            completed = True
+        else:
             raise ValueError("cancellation SSE event fields are not exact")
-        content = payload["content"]
-        stop = payload["stop"]
-        tokens = payload["tokens"]
-        if (
-            type(content) is not str
-            or type(stop) is not bool
-            or type(tokens) is not list
-            or any(type(token) is not int or token < 0 for token in tokens)
-        ):
-            raise ValueError("cancellation SSE event values are invalid")
         if content and not self.first_content_observed:
             self.first_content_observed = True
             self.first_content_event.set()
             self.state_changed_event.set()
-        if stop:
+        if completed:
             self.completed = True
             self.state_changed_event.set()
 
