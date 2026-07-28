@@ -11980,7 +11980,7 @@ def test_step10_windows_lifecycle_constants_are_exact() -> None:
     assert llama_slice.LLAMA_WINDOWS_CREATE_NEW_PROCESS_GROUP == 0x00000200
     assert llama_slice.LLAMA_WINDOWS_CREATE_UNICODE_ENVIRONMENT == 0x00000400
     assert llama_slice.LLAMA_WINDOWS_EXTENDED_STARTUPINFO_PRESENT == 0x00080000
-    assert llama_slice.LLAMA_WINDOWS_CREATION_FLAGS == 0x00080600
+    assert llama_slice.LLAMA_WINDOWS_CREATION_FLAGS == 0x00080400
     assert llama_slice.LLAMA_WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0x00002000
     assert llama_slice.LLAMA_WINDOWS_PROC_THREAD_ATTRIBUTE_HANDLE_LIST == 0x00020002
     assert llama_slice.LLAMA_WINDOWS_PROC_THREAD_ATTRIBUTE_JOB_LIST == 0x0002000D
@@ -12051,6 +12051,12 @@ class _Step10AtomicApi:
         self.attribute_list = object()
         self.create_process_call: dict[str, object] | None = None
         self.shutdown_started = False
+        self.supervisor_process_id = 7_777
+        self.private_console_allocated = False
+        self.child_created = False
+        self.allocated_console_process_ids: tuple[int, ...] | None = None
+        self.pre_signal_console_process_ids: tuple[int, ...] | None = None
+        self._post_child_console_queries = 0
 
     def get_windows_version(self) -> tuple[int, int, int]:
         self.events.append(("version", None))
@@ -12060,11 +12066,39 @@ class _Step10AtomicApi:
         self.events.append(("console-count", None))
         return self.console_process_count
 
+    def get_current_process_id(self) -> int:
+        self.events.append(("current-process-id", None))
+        return self.supervisor_process_id
+
+    def get_console_process_ids(self, *, maximum_ids: int) -> tuple[int, ...]:
+        self.events.append(("console-process-ids", maximum_ids))
+        if not self.private_console_allocated:
+            if self.console_process_count == 0:
+                return ()
+            return (self.supervisor_process_id,)
+        if not self.child_created:
+            if self.allocated_console_process_ids is not None:
+                return self.allocated_console_process_ids
+            return (self.supervisor_process_id,)
+        self._post_child_console_queries += 1
+        if (
+            self._post_child_console_queries > 1
+            and self.pre_signal_console_process_ids is not None
+        ):
+            return self.pre_signal_console_process_ids
+        return (self.supervisor_process_id, 4_242)
+
+    def detach_console(self) -> None:
+        self.events.append(("detach-console", None))
+        self.console_process_count = 0
+
     def allocate_console(self) -> None:
         self.events.append(("allocate-console", None))
+        self.private_console_allocated = True
 
     def free_console(self) -> None:
         self.events.append(("free-console", None))
+        self.private_console_allocated = False
 
     def create_job_object(self, *, name: None, inheritable: bool) -> int:
         self.events.append(("create-job", (name, inheritable)))
@@ -12121,6 +12155,7 @@ class _Step10AtomicApi:
     def create_process(self, **kwargs: object) -> Any:
         self.create_process_call = dict(kwargs)
         self.events.append(("create-process", None))
+        self.child_created = True
         return llama_slice.LlamaWindowsProcessInformation(
             process_handle=107,
             thread_handle=108,
@@ -12156,8 +12191,11 @@ class _Step10AtomicApi:
         self.events.append(("terminate-job", (job_handle, exit_code)))
         self.shutdown_started = True
 
-    def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-        self.events.append(("ctrl-break", process_group_id))
+    def set_console_ctrl_handler(self, *, ignore: bool) -> None:
+        self.events.append(("set-ctrl-handler", ignore))
+
+    def generate_console_ctrl_c(self) -> None:
+        self.events.append(("ctrl-c", 0))
         self.shutdown_started = True
 
     def wait_process(self, *, process_handle: int, timeout_seconds: float) -> bool:
@@ -12167,6 +12205,67 @@ class _Step10AtomicApi:
     def get_process_exit_code(self, *, process_handle: int) -> int:
         self.events.append(("exit-code", process_handle))
         return 0
+
+
+def test_step10_live_launch_detaches_caller_and_owns_exact_private_console() -> None:
+    api = _Step10AtomicApi(console_process_count=1)
+
+    process = llama_slice.start_llama_server_atomic_windows(
+        api=api,  # type: ignore[arg-type]
+        command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+    )
+
+    assert process.launch_evidence.console_mode == "isolated_private"
+    assert process.launch_evidence.creation_flags == 0x00080400
+    assert api.create_process_call is not None
+    assert api.create_process_call["creation_flags"] == 0x00080400
+    event_names = [event for event, _value in api.events]
+    assert event_names[:6] == [
+        "version",
+        "current-process-id",
+        "console-process-ids",
+        "detach-console",
+        "allocate-console",
+        "console-process-ids",
+    ]
+    assert event_names.index("console-process-ids", 6) > event_names.index(
+        "create-process"
+    )
+    assert "console-count" not in event_names
+    assert "set-ctrl-handler" not in event_names
+
+
+def test_step10_post_allocation_foreign_console_pid_fails_closed_and_detaches() -> None:
+    api = _Step10AtomicApi(console_process_count=1)
+    api.allocated_console_process_ids = (api.supervisor_process_id, 8_888)
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.start_llama_server_atomic_windows(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+        )
+
+    assert raised.value.code == "console_failed"
+    event_names = [event for event, _value in api.events]
+    assert event_names[:6] == [
+        "version",
+        "current-process-id",
+        "console-process-ids",
+        "detach-console",
+        "allocate-console",
+        "console-process-ids",
+    ]
+    assert "create-job" not in event_names
+    assert "create-process" not in event_names
+    assert event_names[-1] == "free-console"
+
+
+def test_step10_creation_flags_reject_new_process_group_bit() -> None:
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice._validate_llama_windows_creation_flags(0x00080600)  # type: ignore[attr-defined]
+
+    assert raised.value.code == "invalid_configuration"
+    assert raised.value.__context__ is None
 
 
 def test_step10_nested_job_success_uses_creation_time_job_list_without_breakaway() -> None:
@@ -12181,7 +12280,7 @@ def test_step10_nested_job_success_uses_creation_time_job_list_without_breakaway
                 (llama_slice.LLAMA_WINDOWS_PROC_THREAD_ATTRIBUTE_JOB_LIST, (101,)),
             ) in self.events
             flags = cast(int, kwargs["creation_flags"])
-            assert flags == 0x00080600
+            assert flags == 0x00080400
             assert flags & 0x01000000 == 0
             return super().create_process(**kwargs)
 
@@ -12218,7 +12317,7 @@ def test_step10_incompatible_nested_job_createprocess_failure_fails_closed() -> 
                 (llama_slice.LLAMA_WINDOWS_PROC_THREAD_ATTRIBUTE_JOB_LIST, (101,)),
             ) in self.events
             flags = cast(int, kwargs["creation_flags"])
-            assert flags == 0x00080600
+            assert flags == 0x00080400
             assert flags & 0x01000000 == 0
             raise OSError("SECRET-INCOMPATIBLE-NESTING")
 
@@ -12261,8 +12360,8 @@ def test_step10_atomic_launch_uses_exact_job_attributes_handles_and_process_inpu
     assert isinstance(process, llama_slice.LlamaWindowsManagedProcess)
     assert process.process_id == 4_242
     assert process.launch_evidence == llama_slice.LlamaWindowsLaunchEvidence(
-        console_mode="inherited",
-        creation_flags=0x00080600,
+        console_mode="isolated_private",
+        creation_flags=0x00080400,
         attribute_keys=(0x0002000D, 0x00020002),
         job_limit_flags=0x00002000,
         atomic_assignment_mode="startupinfoex_job_list",
@@ -12271,7 +12370,11 @@ def test_step10_atomic_launch_uses_exact_job_attributes_handles_and_process_inpu
     )
     assert api.events == [
         ("version", None),
-        ("console-count", None),
+        ("current-process-id", None),
+        ("console-process-ids", 4_096),
+        ("detach-console", None),
+        ("allocate-console", None),
+        ("console-process-ids", 4_096),
         ("create-job", (None, False)),
         ("set-job-limit", (101, 0x00002000)),
         ("open-stdin-nul", True),
@@ -12289,6 +12392,7 @@ def test_step10_atomic_launch_uses_exact_job_attributes_handles_and_process_inpu
         ("close-handle", 104),
         ("close-handle", 102),
         ("query-job", (101, 4_096)),
+        ("console-process-ids", 4_096),
     ]
     assert api.create_process_call is not None
     create_call = api.create_process_call
@@ -12299,7 +12403,7 @@ def test_step10_atomic_launch_uses_exact_job_attributes_handles_and_process_inpu
     )
     assert create_call["current_directory"] == os.fspath(command.cwd)
     assert create_call["inherit_handles"] is True
-    assert create_call["creation_flags"] == 0x00080600
+    assert create_call["creation_flags"] == 0x00080400
     expected_environment = "\0".join(
         f"{key}={value}"
         for key, value in sorted(command.environment.items(), key=lambda item: item[0].casefold())
@@ -12317,7 +12421,7 @@ def test_step10_atomic_launch_uses_exact_job_attributes_handles_and_process_inpu
     assert os.fspath(_STEP7_EXECUTABLE_PATH) not in repr(process)
 
 
-def test_step10_atomic_launch_records_probe_allocated_console_without_freeing_it() -> None:
+def test_step10_atomic_launch_records_owned_private_console_without_freeing_it() -> None:
     api = _Step10AtomicApi(console_process_count=0)
 
     process = llama_slice.start_llama_server_atomic_windows(
@@ -12325,10 +12429,12 @@ def test_step10_atomic_launch_records_probe_allocated_console_without_freeing_it
         command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
     )
 
-    assert process.launch_evidence.console_mode == "probe_allocated"
-    assert api.events[1:3] == [
-        ("console-count", None),
+    assert process.launch_evidence.console_mode == "isolated_private"
+    assert api.events[1:5] == [
+        ("current-process-id", None),
+        ("console-process-ids", 4_096),
         ("allocate-console", None),
+        ("console-process-ids", 4_096),
     ]
     assert ("free-console", None) not in api.events
 
@@ -12458,7 +12564,7 @@ def test_step10_missing_root_membership_terminates_job_and_unwinds_once() -> Non
 
     assert raised.value.code == "membership_failed"
     assert raised.value.__context__ is None
-    cleanup_events = api.events[-7:]
+    cleanup_events = api.events[-8:]
     assert cleanup_events[0] == ("terminate-job", (101, 1))
     assert cleanup_events[1][0] == "wait-process"
     wait_handle, wait_seconds = cast(tuple[int, float], cleanup_events[1][1])
@@ -12470,6 +12576,7 @@ def test_step10_missing_root_membership_terminates_job_and_unwinds_once() -> Non
         ("close-handle", 105),
         ("close-handle", 103),
         ("close-handle", 101),
+        ("free-console", None),
     ]
 
 
@@ -12995,8 +13102,9 @@ def test_step10_graceful_shutdown_uses_one_deadline_and_closes_job_last() -> Non
     )
 
     assert evidence == llama_slice.LlamaWindowsShutdownEvidence(
-        signal_kind="CTRL_BREAK_EVENT",
-        target_process_group_id=4_242,
+        signal_kind="CTRL_C_EVENT",
+        signal_scope="isolated_private_console",
+        root_process_id=4_242,
         signal_to_exit_ms=200.0,
         exit_code=0,
         readers_joined=True,
@@ -13004,21 +13112,143 @@ def test_step10_graceful_shutdown_uses_one_deadline_and_closes_job_last() -> Non
         fallback_used=False,
         cleanup_complete=True,
     )
-    assert ("ctrl-break", 4_242) in api.events
+    assert ("ctrl-c", 0) in api.events
+    assert [
+        value for event, value in api.events if event == "set-ctrl-handler"
+    ] == [True, False]
+    pre_signal_console_index = max(
+        index
+        for index, (event, _value) in enumerate(api.events)
+        if event == "console-process-ids"
+    )
+    protect_index = api.events.index(("set-ctrl-handler", True))
+    signal_index = api.events.index(("ctrl-c", 0))
+    wait_index = next(
+        index
+        for index, (event, _value) in enumerate(api.events)
+        if event == "wait-process"
+    )
+    restore_index = api.events.index(("set-ctrl-handler", False))
+    assert (
+        pre_signal_console_index
+        < protect_index
+        < signal_index
+        < wait_index
+        < restore_index
+    )
+    assert ("terminate-job", (101, 1)) not in api.events
     wait_event = next(value for event, value in api.events if event == "wait-process")
     assert cast(tuple[int, float], wait_event) == (107, 14.9)
     assert reader_events == [
         ("join-stdout", 14.7),
         ("join-stderr", 14.6),
     ]
-    assert api.events[-5:] == [
+    assert api.events[-6:] == [
         ("query-job", (101, 4_096)),
         ("close-handle", 107),
         ("close-handle", 105),
         ("close-handle", 103),
         ("close-handle", 101),
+        ("free-console", None),
     ]
     assert all(not event.startswith("cancel-") for event, _value in reader_events)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("signal_kind", "CTRL_BREAK_EVENT"),
+        ("signal_scope", "process_group"),
+        ("root_process_id", 0),
+        ("exit_code", 0xC000013A),
+        ("fallback_used", True),
+    ],
+)
+def test_step10_shutdown_evidence_rejects_untruthful_ctrl_c_mutations(
+    field: str,
+    value: object,
+) -> None:
+    valid_payload: dict[str, object] = {
+        "signal_kind": "CTRL_C_EVENT",
+        "signal_scope": "isolated_private_console",
+        "root_process_id": 4_242,
+        "signal_to_exit_ms": 200.0,
+        "exit_code": 0,
+        "readers_joined": True,
+        "final_job_process_count": 0,
+        "fallback_used": False,
+        "cleanup_complete": True,
+    }
+    valid = llama_slice.LlamaWindowsShutdownEvidence.model_validate(valid_payload)
+    assert valid.root_process_id == 4_242
+
+    payload = dict(valid_payload)
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        llama_slice.LlamaWindowsShutdownEvidence.model_validate(payload)
+
+
+def test_step10_pre_signal_console_pid_mismatch_rejects_without_broadcast() -> None:
+    api = _Step10AtomicApi()
+    process = llama_slice.start_llama_server_atomic_windows(
+        api=api,  # type: ignore[arg-type]
+        command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+    )
+    api.pre_signal_console_process_ids = (
+        api.supervisor_process_id,
+        process.process_id,
+        8_888,
+    )
+    readers = (
+        _Step10LogReaderTask("stdout", []),
+        _Step10LogReaderTask("stderr", []),
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.shutdown_llama_server_atomic_windows(
+            process=process,
+            readers=readers,  # type: ignore[arg-type]
+            clock=_Step8Clock([1_000_000_000]),  # type: ignore[arg-type]
+            wait_strategy=_Step9WaitStrategy(),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == "console_failed"
+    assert ("ctrl-c", 0) not in api.events
+    assert ("set-ctrl-handler", True) not in api.events
+    assert ("terminate-job", (101, 1)) in api.events
+
+
+def test_step10_parent_ctrl_c_protection_failure_never_broadcasts() -> None:
+    class _ProtectionFailingApi(_Step10AtomicApi):
+        def set_console_ctrl_handler(self, *, ignore: bool) -> None:
+            super().set_console_ctrl_handler(ignore=ignore)
+            if ignore:
+                raise OSError("SECRET-PROTECT")
+
+    api = _ProtectionFailingApi()
+    process = llama_slice.start_llama_server_atomic_windows(
+        api=api,  # type: ignore[arg-type]
+        command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.shutdown_llama_server_atomic_windows(
+            process=process,
+            readers=(  # type: ignore[arg-type]
+                _Step10LogReaderTask("stdout", []),
+                _Step10LogReaderTask("stderr", []),
+            ),
+            clock=_Step8Clock([1_000_000_000]),  # type: ignore[arg-type]
+            wait_strategy=_Step9WaitStrategy(),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == "signal_failed"
+    assert ("ctrl-c", 0) not in api.events
+    assert [
+        value for event, value in api.events if event == "set-ctrl-handler"
+    ] == [True]
+    assert ("terminate-job", (101, 1)) in api.events
 
 
 def test_step10_graceful_shutdown_rejects_final_empty_job_at_exact_deadline() -> None:
@@ -13116,9 +13346,9 @@ def test_step10_closehandle_interrupt_preserves_order_and_attempts_every_handle(
 
 def test_step10_signal_failure_forces_cleanup_and_never_returns_evidence() -> None:
     class _SignalFailingApi(_Step10AtomicApi):
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
-            raise OSError("SECRET-CTRL-BREAK")
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
+            raise OSError("SECRET-CTRL-C")
 
     api = _SignalFailingApi()
     process = llama_slice.start_llama_server_atomic_windows(
@@ -13142,6 +13372,9 @@ def test_step10_signal_failure_forces_cleanup_and_never_returns_evidence() -> No
     assert raised.value.code == "signal_failed"
     assert raised.value.__context__ is None
     assert "SECRET-" not in str(raised.value)
+    assert [
+        value for event, value in api.events if event == "set-ctrl-handler"
+    ] == [True, False]
     assert ("terminate-job", (101, 1)) in api.events
     assert reader_events[0:2] == [
         ("cancel-stdout", None),
@@ -13163,6 +13396,49 @@ def test_step10_signal_failure_forces_cleanup_and_never_returns_evidence() -> No
         )
     assert repeated.value.code == "invalid_configuration"
     assert len(api.events) == event_count
+
+
+def test_step10_ctrl_c_handler_restore_failure_prevents_shutdown_evidence() -> None:
+    class _RestoreFailingApi(_Step10AtomicApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.restore_failures = 0
+
+        def set_console_ctrl_handler(self, *, ignore: bool) -> None:
+            super().set_console_ctrl_handler(ignore=ignore)
+            if not ignore and self.restore_failures == 0:
+                self.restore_failures += 1
+                raise OSError("SECRET-RESTORE")
+
+    api = _RestoreFailingApi()
+    process = llama_slice.start_llama_server_atomic_windows(
+        api=api,  # type: ignore[arg-type]
+        command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.shutdown_llama_server_atomic_windows(
+            process=process,
+            readers=(  # type: ignore[arg-type]
+                _Step10LogReaderTask("stdout", []),
+                _Step10LogReaderTask("stderr", []),
+            ),
+            clock=_Step8Clock(
+                [
+                    1_000_000_000,
+                    1_100_000_000,
+                    1_200_000_000,
+                ]
+            ),  # type: ignore[arg-type]
+            wait_strategy=_Step9WaitStrategy(),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == "cleanup_failed"
+    assert api.restore_failures == 1
+    assert [
+        value for event, value in api.events if event == "set-ctrl-handler"
+    ] == [True, False, False]
+    assert ("terminate-job", (101, 1)) in api.events
 
 
 @pytest.mark.parametrize(
@@ -13279,6 +13555,9 @@ def test_step10_graceful_postcondition_failures_force_cleanup_and_keep_primary_c
 
     assert raised.value.code == expected_code
     assert raised.value.__context__ is None
+    assert [
+        value for event, value in api.events if event == "set-ctrl-handler"
+    ] == [True, False]
     assert ("terminate-job", (101, 1)) in api.events
     assert reader_events.count(("cancel-stdout", None)) == 1
     assert reader_events.count(("cancel-stderr", None)) == 1
@@ -13329,8 +13608,8 @@ def test_step10_probe_console_is_freed_after_job_handle_on_graceful_shutdown() -
 
 def test_step10_forced_cleanup_failure_overrides_non_memory_primary_error() -> None:
     class _CleanupFailingApi(_Step10AtomicApi):
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             raise OSError("SECRET-SIGNAL")
 
         def terminate_job_object(self, *, job_handle: int, exit_code: int) -> None:
@@ -13365,8 +13644,8 @@ def test_step10_primary_memory_error_is_preserved_after_successful_forced_cleanu
     marker = MemoryError("SECRET-MEMORY")
 
     class _MemoryFailingApi(_Step10AtomicApi):
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             raise marker
 
     api = _MemoryFailingApi()
@@ -13525,8 +13804,8 @@ def test_step10_forced_cleanup_polls_past_eight_samples_until_job_is_empty(
             super().__init__()
             self.post_terminate_query_count = 0
 
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             raise OSError("SECRET-SIGNAL")
 
         def query_job_process_ids(
@@ -13580,8 +13859,8 @@ def test_step10_forced_cleanup_budget_starts_before_termination_and_reader_cance
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _SignalFailingApi(_Step10AtomicApi):
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             raise OSError("SECRET-SIGNAL")
 
     ticks = iter([100.0, 116.0, 116.0, 116.0, 116.0, 116.0, 116.0])
@@ -13617,8 +13896,8 @@ def test_step10_forced_cleanup_rejects_completion_at_exact_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _SignalFailingApi(_Step10AtomicApi):
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             raise OSError("SECRET-SIGNAL")
 
     monotonic_calls = 0
@@ -13654,8 +13933,8 @@ def test_step10_forced_cleanup_passes_only_shared_remaining_budget_to_concrete_c
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _SignalFailingReaderApi(_Step10PipeReaderApi):
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             raise OSError("SECRET-SIGNAL")
 
     monotonic_calls = 0
@@ -13758,8 +14037,8 @@ def test_step10_graceful_interrupt_forces_cleanup_then_reraises_exact_object() -
             super().__init__()
             self.interrupt_signal = True
 
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             if self.interrupt_signal:
                 self.interrupt_signal = False
                 raise marker
@@ -13810,8 +14089,8 @@ def test_step10_forced_cleanup_interrupt_continues_then_reraises_exact_object() 
             super().__init__()
             self.interrupt_terminate = True
 
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             raise OSError("SECRET-SIGNAL")
 
         def terminate_job_object(self, *, job_handle: int, exit_code: int) -> None:
@@ -13861,8 +14140,8 @@ def test_step10_failed_empty_job_proof_never_releases_private_console(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _NonemptyJobApi(_Step10AtomicApi):
-        def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-            self.events.append(("ctrl-break", process_group_id))
+        def generate_console_ctrl_c(self) -> None:
+            self.events.append(("ctrl-c", 0))
             raise OSError("SECRET-SIGNAL")
 
         def query_job_process_ids(
@@ -16407,8 +16686,8 @@ class _Step10StartupSessionApi(_Step10PipeReaderApi):
         super().terminate_job_object(job_handle=job_handle, exit_code=exit_code)
         self.reader_release.set()
 
-    def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-        super().generate_console_ctrl_break(process_group_id=process_group_id)
+    def generate_console_ctrl_c(self) -> None:
+        super().generate_console_ctrl_c()
         self.reader_release.set()
 
     def wait_process(self, *, process_handle: int, timeout_seconds: float) -> bool:
@@ -16486,11 +16765,11 @@ def test_step10_public_session_start_rejects_unverified_command_before_process_a
 
 def test_step10_report_session_evidence_requires_artifact_postcondition() -> None:
     launch = llama_slice.LlamaWindowsLaunchEvidence(
-        console_mode="inherited",
+        console_mode="isolated_private",
         root_process_id=4_242,
     )
     shutdown = llama_slice.LlamaWindowsShutdownEvidence(
-        target_process_group_id=launch.root_process_id,
+        root_process_id=launch.root_process_id,
         signal_to_exit_ms=100.0,
     )
 
@@ -16581,7 +16860,7 @@ def test_step10_windows_startup_session_starts_readers_before_liveness_and_binds
         del session._router
     original_launch_evidence = session.launch_evidence
     session._process.launch_evidence = llama_slice.LlamaWindowsLaunchEvidence(
-        console_mode="probe_allocated",
+        console_mode="isolated_private",
         root_process_id=1,
     )
     assert session.launch_evidence is original_launch_evidence
@@ -16656,7 +16935,7 @@ def test_step10_windows_session_shutdown_seals_cpu_startup_and_log_evidence(
     assert evidence.launch is session.launch_evidence
     assert evidence.startup.bound_port == session.bound_port == 49_152
     assert evidence.startup.gpu_offload is None
-    assert evidence.shutdown.target_process_group_id == evidence.launch.root_process_id
+    assert evidence.shutdown.root_process_id == evidence.launch.root_process_id
     assert evidence.stdout_log.stream == "stdout"
     assert evidence.stdout_log.total_bytes > 0
     assert evidence.stderr_log.stream == "stderr"
@@ -17059,7 +17338,7 @@ def test_step10_windows_session_shutdown_is_single_use_without_resignalling(
         )
 
     assert raised.value.code == "invalid_configuration"
-    assert [event for event, _value in api.events].count("ctrl-break") == 1
+    assert [event for event, _value in api.events].count("ctrl-c") == 1
 
 
 def test_step10_windows_session_concurrent_shutdown_has_one_winner_and_one_signal(
@@ -17109,7 +17388,7 @@ def test_step10_windows_session_concurrent_shutdown_has_one_winner_and_one_signa
     ]
     assert len(failures) == 1
     assert failures[0].code == "invalid_configuration"
-    assert [event for event, _value in api.events].count("ctrl-break") == 1
+    assert [event for event, _value in api.events].count("ctrl-c") == 1
     assert [event for event, _value in api.events].count("terminate-job") == 0
 
 
@@ -17133,7 +17412,7 @@ def test_step10_generic_graceful_shutdown_rejects_an_attached_session_without_si
 
     assert raised.value.code == "invalid_configuration"
     assert not session._process._closed
-    assert [event for event, _value in api.events].count("ctrl-break") == 0
+    assert [event for event, _value in api.events].count("ctrl-c") == 0
 
     llama_slice._shutdown_llama_server_windows_session_unverified(
         session=session,
@@ -17732,7 +18011,7 @@ def test_step10_shutdown_rejects_nonidentical_attached_reader_tuple() -> None:
 
     assert raised.value.code == "invalid_configuration"
     assert not process._closed
-    assert ("ctrl-break", process.process_id) not in api.events
+    assert ("ctrl-c", 0) not in api.events
 
 
 def test_step10_windows_startup_session_frozen_clock_has_exact_hard_poll_bound(
@@ -17991,7 +18270,7 @@ def _step11_session(*, cuda: bool, process_id: int) -> Any:
     )
     return llama_slice.LlamaWindowsSessionEvidence(
         launch=llama_slice.LlamaWindowsLaunchEvidence(
-            console_mode="inherited",
+            console_mode="isolated_private",
             root_process_id=process_id,
         ),
         startup=llama_slice.LlamaStartupEvidence(
@@ -18009,7 +18288,7 @@ def _step11_session(*, cuda: bool, process_id: int) -> Any:
             sha256="2" * 64,
         ),
         shutdown=llama_slice.LlamaWindowsShutdownEvidence(
-            target_process_group_id=process_id,
+            root_process_id=process_id,
             signal_to_exit_ms=125.0,
         ),
         artifacts=llama_slice.LlamaArtifactPostconditionEvidence(),
@@ -19896,8 +20175,9 @@ def test_step13_one_shot_probe_uses_atomic_job_drains_and_returns_bounded_eviden
         subprocess.list2cmdline(command.argv)
     )
     assert api.create_process_call["current_directory"] == os.fspath(command.cwd)
-    assert api.create_process_call["creation_flags"] == 0x00080600
-    assert "ctrl-break" not in [event for event, _value in api.events]
+    assert api.create_process_call["creation_flags"] == 0x00080400
+    assert "ctrl-c" not in [event for event, _value in api.events]
+    assert "set-ctrl-handler" not in [event for event, _value in api.events]
     assert "terminate-job" not in [event for event, _value in api.events]
     assert ("close-handle", 107) in api.events
     assert ("close-handle", 101) in api.events

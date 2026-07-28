@@ -123,7 +123,8 @@ LLAMA_WINDOWS_MINIMUM_MAJOR_VERSION = 10
 LLAMA_WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
 LLAMA_WINDOWS_CREATE_UNICODE_ENVIRONMENT = 0x00000400
 LLAMA_WINDOWS_EXTENDED_STARTUPINFO_PRESENT = 0x00080000
-LLAMA_WINDOWS_CREATION_FLAGS = 0x00080600
+LLAMA_WINDOWS_CREATION_FLAGS = 0x00080400
+LLAMA_WINDOWS_CTRL_C_EVENT = 0
 LLAMA_WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 LLAMA_WINDOWS_PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 LLAMA_WINDOWS_PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
@@ -137,6 +138,7 @@ LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS = 0.05
 MAX_LLAMA_WINDOWS_STARTUP_POLLS = 6_001
 MAX_LLAMA_ONE_SHOT_PROBE_POLLS = 601
 MAX_LLAMA_WINDOWS_LIFECYCLE_POLLS = 301
+MAX_LLAMA_WINDOWS_CONSOLE_PROCESS_IDS = 4_096
 MAX_LLAMA_WINDOWS_JOB_PROCESS_IDS = 4_096
 MAX_LLAMA_WINDOWS_JOB_QUERY_RETRIES = 8
 MAX_LLAMA_WINDOWS_ATTRIBUTE_LIST_BYTES = 1 * 1024 * 1024
@@ -1030,7 +1032,11 @@ class LlamaProcessRunner(Protocol):
 class LlamaWindowsProcessApi(Protocol):
     def get_windows_version(self) -> tuple[int, int, int]: ...
 
-    def get_console_process_count(self) -> int: ...
+    def get_current_process_id(self) -> int: ...
+
+    def get_console_process_ids(self, *, maximum_ids: int) -> tuple[int, ...]: ...
+
+    def detach_console(self) -> None: ...
 
     def allocate_console(self) -> None: ...
 
@@ -1095,7 +1101,9 @@ class LlamaWindowsProcessApi(Protocol):
 
     def terminate_job_object(self, *, job_handle: int, exit_code: int) -> None: ...
 
-    def generate_console_ctrl_break(self, *, process_group_id: int) -> None: ...
+    def set_console_ctrl_handler(self, *, ignore: bool) -> None: ...
+
+    def generate_console_ctrl_c(self) -> None: ...
 
     def wait_process(self, *, process_handle: int, timeout_seconds: float) -> bool: ...
 
@@ -1131,12 +1139,16 @@ class CtypesLlamaWindowsProcessApi:
 
     def _configure_functions(self) -> None:
         kernel32 = self._kernel32
+        kernel32.GetCurrentProcessId.argtypes = []
+        kernel32.GetCurrentProcessId.restype = wintypes.DWORD
         kernel32.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
         kernel32.GetConsoleProcessList.restype = wintypes.DWORD
         kernel32.AllocConsole.argtypes = []
         kernel32.AllocConsole.restype = wintypes.BOOL
         kernel32.FreeConsole.argtypes = []
         kernel32.FreeConsole.restype = wintypes.BOOL
+        kernel32.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+        kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
         kernel32.CreateJobObjectW.argtypes = [
             ctypes.POINTER(_Win32SecurityAttributes),
             wintypes.LPCWSTR,
@@ -1273,16 +1285,39 @@ class CtypesLlamaWindowsProcessApi:
             int(platform_version[2]),
         )
 
-    def get_console_process_count(self) -> int:
-        process_ids = (wintypes.DWORD * 1)()
+    def get_current_process_id(self) -> int:
+        process_id = int(self._kernel32.GetCurrentProcessId())
+        if process_id <= 0:
+            raise OSError("Win32 returned an invalid current process identifier")
+        return process_id
+
+    def get_console_process_ids(self, *, maximum_ids: int) -> tuple[int, ...]:
+        if (
+            type(maximum_ids) is not int
+            or maximum_ids <= 0
+            or maximum_ids > MAX_LLAMA_WINDOWS_CONSOLE_PROCESS_IDS
+        ):
+            _raise_llama_lifecycle_error("invalid_configuration")
+        process_ids = (wintypes.DWORD * maximum_ids)()
         ctypes.set_last_error(0)
-        count = int(self._kernel32.GetConsoleProcessList(process_ids, 1))
+        count = int(self._kernel32.GetConsoleProcessList(process_ids, maximum_ids))
+        if count > maximum_ids:
+            raise OSError("Console process list exceeded its bound")
         if count > 0:
-            return count
+            exact = tuple(int(process_ids[index]) for index in range(count))
+            if any(process_id <= 0 for process_id in exact) or len(set(exact)) != len(
+                exact
+            ):
+                raise OSError("Win32 returned an invalid console process list")
+            return exact
         error_code = ctypes.get_last_error()
         if error_code == 6:
-            return 0
+            return ()
         raise ctypes.WinError(error_code)
+
+    def detach_console(self) -> None:
+        if not self._kernel32.FreeConsole():
+            self._raise_last_error()
 
     def allocate_console(self) -> None:
         if not self._kernel32.AllocConsole():
@@ -1694,10 +1729,17 @@ class CtypesLlamaWindowsProcessApi:
         ):
             self._raise_last_error()
 
-    def generate_console_ctrl_break(self, *, process_group_id: int) -> None:
-        if type(process_group_id) is not int or process_group_id <= 0:
+    def set_console_ctrl_handler(self, *, ignore: bool) -> None:
+        if type(ignore) is not bool:
             _raise_llama_lifecycle_error("invalid_configuration")
-        if not self._kernel32.GenerateConsoleCtrlEvent(1, process_group_id):
+        if not self._kernel32.SetConsoleCtrlHandler(None, ignore):
+            self._raise_last_error()
+
+    def generate_console_ctrl_c(self) -> None:
+        if not self._kernel32.GenerateConsoleCtrlEvent(
+            LLAMA_WINDOWS_CTRL_C_EVENT,
+            0,
+        ):
             self._raise_last_error()
 
     def wait_process(self, *, process_handle: int, timeout_seconds: float) -> bool:
@@ -2684,8 +2726,8 @@ def measure_llama_process_tree_scopes(
 
 
 class LlamaWindowsLaunchEvidence(_StrictFrozenModel):
-    console_mode: Literal["inherited", "probe_allocated"]
-    creation_flags: Literal[525_824] = 525_824
+    console_mode: Literal["isolated_private"] = "isolated_private"
+    creation_flags: Literal[525_312] = 525_312
     attribute_keys: tuple[Literal[131_085], Literal[131_074]] = (
         131_085,
         131_074,
@@ -2697,8 +2739,9 @@ class LlamaWindowsLaunchEvidence(_StrictFrozenModel):
 
 
 class LlamaWindowsShutdownEvidence(_StrictFrozenModel):
-    signal_kind: Literal["CTRL_BREAK_EVENT"] = "CTRL_BREAK_EVENT"
-    target_process_group_id: int = Field(gt=0)
+    signal_kind: Literal["CTRL_C_EVENT"] = "CTRL_C_EVENT"
+    signal_scope: Literal["isolated_private_console"] = "isolated_private_console"
+    root_process_id: int = Field(gt=0)
     signal_to_exit_ms: float = Field(ge=0.0, le=15_000.0)
     exit_code: Literal[0] = 0
     readers_joined: Literal[True] = True
@@ -2721,6 +2764,7 @@ class LlamaWindowsManagedProcess:
         "_cleanup_error",
         "_closed",
         "_construction_token",
+        "_ctrl_c_ignore_enabled",
         "_handle_close_uncertain",
         "_job_handle",
         "_lock",
@@ -2730,6 +2774,7 @@ class LlamaWindowsManagedProcess:
         "_startup_session",
         "_stderr_read_handle",
         "_stdout_read_handle",
+        "_supervisor_process_id",
         "launch_evidence",
         "process_id",
     )
@@ -2744,6 +2789,7 @@ class LlamaWindowsManagedProcess:
         stdout_read_handle: int,
         stderr_read_handle: int,
         private_console: bool,
+        supervisor_process_id: int,
         launch_evidence: LlamaWindowsLaunchEvidence,
         artifact_lease: LlamaRunArtifactLease | None = None,
         artifact_binding_capability: object | None = None,
@@ -2755,7 +2801,14 @@ class LlamaWindowsManagedProcess:
         _require_llama_windows_handle(job_handle)
         _require_llama_windows_handle(stdout_read_handle)
         _require_llama_windows_handle(stderr_read_handle)
-        if type(process_id) is not int or process_id <= 0 or type(private_console) is not bool:
+        if (
+            type(process_id) is not int
+            or process_id <= 0
+            or private_console is not True
+            or type(supervisor_process_id) is not int
+            or supervisor_process_id <= 0
+            or supervisor_process_id == process_id
+        ):
             _raise_llama_lifecycle_error("invalid_configuration")
         if (artifact_lease is None) != (artifact_binding_capability is None):
             _raise_llama_lifecycle_error("invalid_configuration")
@@ -2781,7 +2834,9 @@ class LlamaWindowsManagedProcess:
         self._job_handle: int | None = job_handle
         self._stdout_read_handle: int | None = stdout_read_handle
         self._stderr_read_handle: int | None = stderr_read_handle
-        self._private_console = private_console
+        self._private_console: bool = private_console
+        self._supervisor_process_id: int = supervisor_process_id
+        self._ctrl_c_ignore_enabled: bool = False
         self._handle_close_uncertain = False
         self._log_readers: (
             tuple[LlamaWindowsPipeLogReaderTask, LlamaWindowsPipeLogReaderTask] | None
@@ -3054,7 +3109,7 @@ class _LlamaWindowsUnverifiedSessionEvidence(_StrictFrozenModel):
     @model_validator(mode="after")
     def _validate_session_evidence(self) -> Self:
         if (
-            self.launch.root_process_id != self.shutdown.target_process_group_id
+            self.launch.root_process_id != self.shutdown.root_process_id
             or self.stdout_log.stream != "stdout"
             or self.stderr_log.stream != "stderr"
         ):
@@ -3073,7 +3128,7 @@ class LlamaWindowsSessionEvidence(_StrictFrozenModel):
     @model_validator(mode="after")
     def _validate_session_evidence(self) -> Self:
         if (
-            self.launch.root_process_id != self.shutdown.target_process_group_id
+            self.launch.root_process_id != self.shutdown.root_process_id
             or self.stdout_log.stream != "stdout"
             or self.stderr_log.stream != "stderr"
         ):
@@ -10320,6 +10375,48 @@ def _query_complete_llama_job_process_ids(
     _raise_llama_lifecycle_error("membership_failed")
 
 
+def _query_exact_llama_console_process_ids(
+    *,
+    api: LlamaWindowsProcessApi,
+) -> tuple[int, ...]:
+    try:
+        process_ids = api.get_console_process_ids(
+            maximum_ids=MAX_LLAMA_WINDOWS_CONSOLE_PROCESS_IDS
+        )
+    except MemoryError:
+        raise
+    except LlamaSliceLifecycleError:
+        raise
+    except Exception:
+        _raise_llama_lifecycle_error("console_failed")
+    if (
+        type(process_ids) is not tuple
+        or len(process_ids) > MAX_LLAMA_WINDOWS_CONSOLE_PROCESS_IDS
+        or any(type(process_id) is not int or process_id <= 0 for process_id in process_ids)
+        or len(set(process_ids)) != len(process_ids)
+    ):
+        _raise_llama_lifecycle_error("console_failed")
+    return process_ids
+
+
+def _require_exact_llama_console_process_ids(
+    *,
+    api: LlamaWindowsProcessApi,
+    expected_process_ids: frozenset[int],
+) -> None:
+    if (
+        type(expected_process_ids) is not frozenset
+        or not expected_process_ids
+        or any(
+            type(process_id) is not int or process_id <= 0
+            for process_id in expected_process_ids
+        )
+        or frozenset(_query_exact_llama_console_process_ids(api=api))
+        != expected_process_ids
+    ):
+        _raise_llama_lifecycle_error("console_failed")
+
+
 def _start_llama_process_atomic_windows(
     *,
     api: LlamaWindowsProcessApi,
@@ -10357,6 +10454,7 @@ def _start_llama_process_atomic_windows(
     artifact_binding_capability: object | None = None
 
     private_console = False
+    supervisor_process_id: int | None = None
     attribute_list: object | None = None
     process_information: LlamaWindowsProcessInformation | None = None
     process_creation_ownership = _LlamaWindowsProcessCreationOwnership()
@@ -10407,12 +10505,22 @@ def _start_llama_process_atomic_windows(
                 token=_LLAMA_RUN_ARTIFACT_LEASE_TOKEN,
             )
         try:
-            console_process_count = api.get_console_process_count()
-            if type(console_process_count) is not int or console_process_count < 0:
+            supervisor_process_id = api.get_current_process_id()
+            if type(supervisor_process_id) is not int or supervisor_process_id <= 0:
                 _raise_llama_lifecycle_error("console_failed")
-            if console_process_count == 0:
-                api.allocate_console()
-                private_console = True
+            inherited_console_process_ids = _query_exact_llama_console_process_ids(
+                api=api
+            )
+            if inherited_console_process_ids:
+                if supervisor_process_id not in inherited_console_process_ids:
+                    _raise_llama_lifecycle_error("console_failed")
+                api.detach_console()
+            api.allocate_console()
+            private_console = True
+            _require_exact_llama_console_process_ids(
+                api=api,
+                expected_process_ids=frozenset((supervisor_process_id,)),
+            )
         except MemoryError:
             raise
         except LlamaSliceLifecycleError:
@@ -10566,8 +10674,14 @@ def _start_llama_process_atomic_windows(
         )
         if process_information.process_id not in process_ids:
             _raise_llama_lifecycle_error("membership_failed")
+        assert supervisor_process_id is not None
+        _require_exact_llama_console_process_ids(
+            api=api,
+            expected_process_ids=frozenset(
+                (supervisor_process_id, process_information.process_id)
+            ),
+        )
         evidence = LlamaWindowsLaunchEvidence(
-            console_mode="probe_allocated" if private_console else "inherited",
             root_process_id=process_information.process_id,
         )
         managed = LlamaWindowsManagedProcess(
@@ -10578,6 +10692,7 @@ def _start_llama_process_atomic_windows(
             stdout_read_handle=stdout_parent,
             stderr_read_handle=stderr_parent,
             private_console=private_console,
+            supervisor_process_id=supervisor_process_id,
             launch_evidence=evidence,
             artifact_lease=artifact_lease,
             artifact_binding_capability=artifact_binding_capability,
@@ -10865,7 +10980,7 @@ def _close_llama_windows_managed_resources(
 ) -> None:
     if type(close_pipe_handles) is not bool or type(release_private_console) is not bool:
         _raise_llama_lifecycle_error("invalid_configuration")
-    failed = process._handle_close_uncertain
+    failed = process._handle_close_uncertain or process._ctrl_c_ignore_enabled
     cleanup_error: BaseException | None = None
     handle_attributes = ["_process_handle"]
     if close_pipe_handles:
@@ -10908,6 +11023,7 @@ def _close_llama_windows_managed_resources(
         process._private_console
         and release_private_console
         and all_handles_released
+        and not process._ctrl_c_ignore_enabled
         and not process._handle_close_uncertain
         and not failed
     ):
@@ -10933,6 +11049,38 @@ def _close_llama_windows_managed_resources(
         _raise_llama_lifecycle_error("cleanup_failed")
 
 
+def _enable_llama_windows_ctrl_c_ignore(
+    process: LlamaWindowsManagedProcess,
+) -> None:
+    if process._ctrl_c_ignore_enabled:
+        _raise_llama_lifecycle_error("invalid_configuration")
+    try:
+        process._api.set_console_ctrl_handler(ignore=True)
+    except MemoryError:
+        raise
+    except LlamaSliceLifecycleError:
+        raise
+    except Exception:
+        _raise_llama_lifecycle_error("signal_failed")
+    process._ctrl_c_ignore_enabled = True
+
+
+def _restore_llama_windows_ctrl_c_ignore(
+    process: LlamaWindowsManagedProcess,
+) -> None:
+    if not process._ctrl_c_ignore_enabled:
+        return
+    try:
+        process._api.set_console_ctrl_handler(ignore=False)
+    except MemoryError:
+        raise
+    except LlamaSliceLifecycleError:
+        raise
+    except Exception:
+        _raise_llama_lifecycle_error("cleanup_failed")
+    process._ctrl_c_ignore_enabled = False
+
+
 def _run_llama_windows_graceful_shutdown(
     *,
     process: LlamaWindowsManagedProcess,
@@ -10940,15 +11088,29 @@ def _run_llama_windows_graceful_shutdown(
     clock: LlamaMonotonicClock,
     wait_strategy: LlamaWaitStrategy,
 ) -> LlamaWindowsShutdownEvidence:
+    _require_exact_llama_console_process_ids(
+        api=process._api,
+        expected_process_ids=frozenset(
+            (process._supervisor_process_id, process.process_id)
+        ),
+    )
     signal_started_ns = _read_llama_lifecycle_clock(clock, previous_ns=None)
     deadline_ns = signal_started_ns + int(
         LLAMA_WINDOWS_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS * 1_000_000_000
     )
+    _enable_llama_windows_ctrl_c_ignore(process)
+    signal_error: BaseException | None = None
     try:
-        process._api.generate_console_ctrl_break(process_group_id=process.process_id)
-    except MemoryError:
-        raise
-    except Exception:
+        process._api.generate_console_ctrl_c()
+    except BaseException as error:
+        signal_error = error
+    if signal_error is not None:
+        _restore_llama_windows_ctrl_c_ignore(process)
+        if isinstance(signal_error, MemoryError) or not isinstance(
+            signal_error,
+            Exception,
+        ):
+            raise signal_error
         _raise_llama_lifecycle_error("signal_failed")
     signal_finished_ns = _read_llama_lifecycle_clock(
         clock,
@@ -10974,6 +11136,7 @@ def _run_llama_windows_graceful_shutdown(
     process_exit_ns = _read_llama_lifecycle_clock(clock, previous_ns=signal_finished_ns)
     if process_exit_ns >= deadline_ns:
         _raise_llama_lifecycle_error("shutdown_timeout")
+    _restore_llama_windows_ctrl_c_ignore(process)
     try:
         exit_code = process._api.get_process_exit_code(
             process_handle=process_handle
@@ -11050,7 +11213,7 @@ def _run_llama_windows_graceful_shutdown(
         _raise_llama_lifecycle_error("job_not_empty")
     try:
         evidence = LlamaWindowsShutdownEvidence(
-            target_process_group_id=process.process_id,
+            root_process_id=process.process_id,
             signal_to_exit_ms=(process_exit_ns - signal_started_ns) / 1_000_000.0,
         )
     except MemoryError:
@@ -11204,6 +11367,16 @@ def _force_cleanup_llama_windows_process(
                 timeout_seconds=remaining_cleanup_seconds(),
             ):
                 failed = True
+        except MemoryError as error:
+            record_cleanup_error(error)
+        except Exception:
+            failed = True
+        except BaseException as error:
+            record_cleanup_error(error)
+        remaining_cleanup_seconds()
+    if process._ctrl_c_ignore_enabled:
+        try:
+            _restore_llama_windows_ctrl_c_ignore(process)
         except MemoryError as error:
             record_cleanup_error(error)
         except Exception:
