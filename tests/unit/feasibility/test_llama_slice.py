@@ -20546,7 +20546,10 @@ def test_step13_one_shot_empty_streams_fail_closed_without_artificial_output(
 
 
 class _Step13HealthTransport:
-    def __init__(self, responses: list[llama_slice.LlamaHttpBody]) -> None:
+    def __init__(
+        self,
+        responses: list[llama_slice.LlamaHttpBody | BaseException],
+    ) -> None:
         self.responses = responses
         self.timeouts: list[float] = []
 
@@ -20554,7 +20557,10 @@ class _Step13HealthTransport:
         self.timeouts.append(total_timeout_seconds)
         if not self.responses:
             raise AssertionError("health poll exceeded the supplied responses")
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def test_step13_health_ready_poll_retains_loading_and_uses_one_deadline() -> None:
@@ -20595,6 +20601,153 @@ def test_step13_health_ready_poll_retains_loading_and_uses_one_deadline() -> Non
     assert wait_strategy.calls == [
         llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS
     ]
+
+
+def test_step13_health_read_timeout_then_exact_loading_ready_sequence() -> None:
+    transport = _Step13HealthTransport(
+        [
+            llama_slice.LlamaSliceHttpError("read_timeout"),
+            llama_slice.LlamaHttpBody(
+                status_code=503,
+                body=_STEP7_HEALTH_LOADING_BODY,
+            ),
+            llama_slice.LlamaHttpBody(
+                status_code=200,
+                body=_STEP7_HEALTH_READY_BODY,
+            ),
+        ]
+    )
+    wait_strategy = _Step9WaitStrategy()
+
+    evidence = llama_slice._wait_for_llama_health_ready(
+        transport=transport,  # type: ignore[arg-type]
+        clock=_Step8Clock(
+            [
+                1_000_000_000,
+                1_100_000_000,
+                1_200_000_000,
+                1_300_000_000,
+            ]
+        ),  # type: ignore[arg-type]
+        wait_strategy=wait_strategy,  # type: ignore[arg-type]
+    )
+
+    assert evidence == llama_slice.LlamaHealthEvidence(
+        observed_loading=True,
+        ready=True,
+    )
+    assert len(transport.timeouts) == 3
+    assert wait_strategy.calls == [
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS,
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS,
+    ]
+
+
+def test_step13_health_read_timeout_then_ready_is_not_validator_loading() -> None:
+    transport = _Step13HealthTransport(
+        [
+            llama_slice.LlamaSliceHttpError("read_timeout"),
+            llama_slice.LlamaHttpBody(
+                status_code=200,
+                body=_STEP7_HEALTH_READY_BODY,
+            ),
+        ]
+    )
+    wait_strategy = _Step9WaitStrategy()
+
+    evidence = llama_slice._wait_for_llama_health_ready(
+        transport=transport,  # type: ignore[arg-type]
+        clock=_Step8Clock(
+            [
+                1_000_000_000,
+                1_100_000_000,
+                1_200_000_000,
+            ]
+        ),  # type: ignore[arg-type]
+        wait_strategy=wait_strategy,  # type: ignore[arg-type]
+    )
+
+    assert evidence == llama_slice.LlamaHealthEvidence(
+        observed_loading=False,
+        ready=True,
+    )
+    assert len(transport.timeouts) == 2
+    assert wait_strategy.calls == [
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS
+    ]
+
+
+def test_step13_repeated_health_read_timeout_stops_at_shared_deadline() -> None:
+    transport = _Step13HealthTransport(
+        [
+            llama_slice.LlamaSliceHttpError("read_timeout"),
+            llama_slice.LlamaSliceHttpError("read_timeout"),
+        ]
+    )
+    wait_strategy = _Step9WaitStrategy()
+
+    with pytest.raises(
+        llama_slice.LlamaSliceStartupError,
+        match="health sequence did not reach ready",
+    ):
+        llama_slice._wait_for_llama_health_ready(
+            transport=transport,  # type: ignore[arg-type]
+            clock=_Step8Clock(
+                [
+                    1_000_000_000,
+                    1_100_000_000,
+                    2_000_000_000,
+                    301_000_000_000,
+                ]
+            ),  # type: ignore[arg-type]
+            wait_strategy=wait_strategy,  # type: ignore[arg-type]
+        )
+
+    assert len(transport.timeouts) == 2
+    assert wait_strategy.calls == [
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS,
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS,
+    ]
+
+
+def test_step13_non_read_timeout_health_error_propagates_without_retry() -> None:
+    marker = llama_slice.LlamaSliceHttpError("connect_timeout")
+    transport = _Step13HealthTransport([marker])
+    wait_strategy = _Step9WaitStrategy()
+
+    with pytest.raises(llama_slice.LlamaSliceHttpError) as raised:
+        llama_slice._wait_for_llama_health_ready(
+            transport=transport,  # type: ignore[arg-type]
+            clock=_Step8Clock([1_000_000_000, 1_100_000_000]),  # type: ignore[arg-type]
+            wait_strategy=wait_strategy,  # type: ignore[arg-type]
+        )
+
+    assert raised.value is marker
+    assert len(transport.timeouts) == 1
+    assert wait_strategy.calls == []
+
+
+def test_step13_health_read_timeout_retains_finite_poll_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llama_slice, "MAX_LLAMA_WINDOWS_STARTUP_POLLS", 3)
+    transport = _Step13HealthTransport(
+        [llama_slice.LlamaSliceHttpError("read_timeout") for _index in range(3)]
+    )
+    wait_strategy = _Step9WaitStrategy()
+
+    with pytest.raises(
+        llama_slice.LlamaSliceStartupError,
+        match="health sequence did not reach ready",
+    ):
+        llama_slice._wait_for_llama_health_ready(
+            transport=transport,  # type: ignore[arg-type]
+            clock=_Step8Clock([1_000_000_000] * 4),  # type: ignore[arg-type]
+            wait_strategy=wait_strategy,  # type: ignore[arg-type]
+        )
+
+    assert len(transport.timeouts) == 3
+    assert len(wait_strategy.calls) == 2
 
 
 def test_step13_ephemeral_workspace_owns_redacted_key_and_strict_cleanup(

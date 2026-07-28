@@ -16595,18 +16595,24 @@ def _wait_for_llama_health_ready(
                     "Llama health sequence did not reach ready."
                 )
             remaining_seconds = (deadline_ns - observed_ns) / 1_000_000_000.0
-            response = transport.get_health(
-                total_timeout_seconds=min(
-                    LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS,
-                    remaining_seconds,
+            response: LlamaHttpBody | None = None
+            try:
+                response = transport.get_health(
+                    total_timeout_seconds=min(
+                        LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS,
+                        remaining_seconds,
+                    )
                 )
-            )
-            validator.feed(
-                status_code=response.status_code,
-                body=response.body,
-            )
-            if response.status_code == 200:
-                return validator.finish()
+            except LlamaSliceHttpError as error:
+                if error.code != "read_timeout":
+                    raise
+            if response is not None:
+                validator.feed(
+                    status_code=response.status_code,
+                    body=response.body,
+                )
+                if response.status_code == 200:
+                    return validator.finish()
             if poll_index + 1 >= MAX_LLAMA_WINDOWS_STARTUP_POLLS:
                 break
             wait_strategy.wait(
