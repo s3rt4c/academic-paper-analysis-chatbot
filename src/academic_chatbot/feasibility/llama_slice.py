@@ -4398,6 +4398,12 @@ def _canonical_redacted_llama_flags(
         "<redacted-key-file>",
         "--n-gpu-layers",
         str(launch_profile.n_gpu_layers),
+        "--verbosity",
+        "4",
+        "--no-log-prefix",
+        "--no-log-timestamps",
+        "--log-colors",
+        "off",
     )
 
 
@@ -4428,7 +4434,7 @@ class LlamaSliceReport(_StrictFrozenModel):
     gguf_sha256: str = Field(pattern=SHA256_PATTERN)
     gguf_quantization: Literal["Q4_K_M"]
     llama_release: Literal["b10007"] = "b10007"
-    llama_flags: tuple[str, ...] = Field(min_length=28, max_length=28)
+    llama_flags: tuple[str, ...] = Field(min_length=34, max_length=34)
     prompt_profile: LlamaPromptProfile
     prompt_profile_sha256: str = Field(pattern=SHA256_PATTERN)
     response_schema: LlamaResponseSchema
@@ -9847,11 +9853,17 @@ def _build_llama_server_argv(
         os.fspath(api_key_file_path),
         "--n-gpu-layers",
         str(launch_profile.n_gpu_layers),
+        "--verbosity",
+        "4",
+        "--no-log-prefix",
+        "--no-log-timestamps",
+        "--log-colors",
+        "off",
     )
 
 
 def _redact_llama_server_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
-    if len(argv) != 29:
+    if len(argv) != 35:
         raise LlamaSliceStartupError("Llama server argument array is not valid.")
     redacted = list(argv)
     redacted[0] = "<verified-runtime-executable>"
@@ -10151,7 +10163,7 @@ def _revalidate_llama_server_launch_command(
             _construction_token=_LLAMA_LAUNCH_COMMAND_TOKEN,
             _artifact_lease=command._artifact_lease,
         )
-        if len(copied.argv) != 29 or copied.argv[27] != "--n-gpu-layers":
+        if len(copied.argv) != 35 or copied.argv[27] != "--n-gpu-layers":
             raise ValueError("launch argument structure is not valid")
         if copied.argv[28] == "0":
             profile = FROZEN_RUNTIME_PROFILES[CPU_RUNTIME_PROFILE_ID].launch_profile

@@ -5968,6 +5968,12 @@ def _step7_expected_argv(*, n_gpu_layers: str) -> tuple[str, ...]:
         os.fspath(_STEP7_KEY_FILE_PATH),
         "--n-gpu-layers",
         n_gpu_layers,
+        "--verbosity",
+        "4",
+        "--no-log-prefix",
+        "--no-log-timestamps",
+        "--log-colors",
+        "off",
     )
 
 
@@ -5990,6 +5996,46 @@ def test_step7_launch_command_freezes_exact_cpu_and_cuda_argv(
     assert "--host" in command.argv
     assert command.argv[command.argv.index("--host") + 1] == "127.0.0.1"
     assert command.argv[command.argv.index("--port") + 1] == "0"
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "n_gpu_layers"),
+    [
+        (llama_slice.CPU_RUNTIME_PROFILE_ID, "0"),
+        (llama_slice.CUDA_RUNTIME_PROFILE_ID, "auto"),
+    ],
+)
+def test_step7_launch_logging_flags_pin_canonical_parser_input(
+    profile_id: str,
+    n_gpu_layers: str,
+) -> None:
+    command = _step7_launch_command(profile_id=profile_id)
+    expected_suffix = (
+        "--n-gpu-layers",
+        n_gpu_layers,
+        "--verbosity",
+        "4",
+        "--no-log-prefix",
+        "--no-log-timestamps",
+        "--log-colors",
+        "off",
+    )
+
+    assert command.argv[-8:] == expected_suffix
+    assert command.redacted_argv[-8:] == expected_suffix
+    assert (
+        llama_slice._canonical_redacted_llama_flags(
+            llama_slice.FROZEN_RUNTIME_PROFILES[profile_id].launch_profile
+        )[-8:]
+        == expected_suffix
+    )
+
+    parser = llama_slice.LlamaStartupLogParser()
+    parser.feed_line(
+        stream="stderr",
+        line="srv  llama_server: listening on http://127.0.0.1:49152",
+    )
+    assert parser.snapshot_bound_port() == 49_152
 
 
 def test_step7_launch_command_redacts_every_local_path_and_secret_canary() -> None:
@@ -6362,8 +6408,47 @@ def test_step7_environment_rejects_ambiguous_or_injectable_entries(
             environment={**command.environment, "LLAMA_ARG_HOST": "0.0.0.0"},
         ),
         lambda command: replace(command, cwd=Path("C:/different-runtime")),
+        lambda command: replace(
+            command,
+            argv=tuple(
+                "3" if index == 30 else value for index, value in enumerate(command.argv)
+            ),
+        ),
+        lambda command: replace(
+            command,
+            argv=tuple(
+                "--log-prefix"
+                if index == 31
+                else value
+                for index, value in enumerate(command.argv)
+            ),
+        ),
+        lambda command: replace(
+            command,
+            argv=tuple(
+                "--log-timestamps"
+                if index == 32
+                else value
+                for index, value in enumerate(command.argv)
+            ),
+        ),
+        lambda command: replace(
+            command,
+            argv=tuple(
+                "on" if index == 34 else value for index, value in enumerate(command.argv)
+            ),
+        ),
     ],
-    ids=("argv", "redaction", "environment", "cwd"),
+    ids=(
+        "argv",
+        "redaction",
+        "environment",
+        "cwd",
+        "verbosity",
+        "log-prefix",
+        "log-timestamps",
+        "log-colors",
+    ),
 )
 def test_step7_start_rejects_tampered_command_before_runner(mutator: Any) -> None:
     command = mutator(_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID))
@@ -6400,6 +6485,25 @@ def test_step7_launch_command_rejects_mutable_argument_lists() -> None:
             redacted_argv=command.redacted_argv,
             cwd=command.cwd,
             environment=command.environment,
+        )
+
+
+def test_step7_launch_command_rejects_non_string_logging_value() -> None:
+    valid = _step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID)
+    forged_argv = list(_step7_expected_argv(n_gpu_layers="0"))
+    forged_argv[30] = 4  # type: ignore[list-item]
+    forged_redacted_argv = list(forged_argv)
+    forged_redacted_argv[0] = "<verified-runtime-executable>"
+    forged_redacted_argv[2] = "<verified-model>"
+    forged_redacted_argv[26] = "<redacted-key-file>"
+
+    with pytest.raises(llama_slice.LlamaSliceStartupError, match="argument"):
+        llama_slice.LlamaServerLaunchCommand(
+            argv=tuple(forged_argv),
+            redacted_argv=tuple(forged_redacted_argv),
+            cwd=valid.cwd,
+            environment=valid.environment,
+            _construction_token=valid._construction_token,
         )
 
 
@@ -6604,6 +6708,7 @@ def test_step7_version_parser_does_not_leak_invalid_output_in_traceback() -> Non
 @pytest.mark.parametrize(
     "line",
     [
+        "0.09.193.157 I srv  llama_server: listening on http://127.0.0.1:49152",
         "prefix srv  llama_server: listening on http://127.0.0.1:49152",
         "srv  llama_server: listening on http://127.0.0.1:49152 suffix",
         "srv  llama_server: listening on http://127.0.0.1:049152",
@@ -6613,6 +6718,7 @@ def test_step7_version_parser_does_not_leak_invalid_output_in_traceback() -> Non
         "x" * (llama_slice.MAX_LLAMA_STARTUP_LINE_CHARACTERS + 1),
     ],
     ids=(
+        "observed-b10007-prefix",
         "embedded-port",
         "port-suffix",
         "leading-zero-port",
@@ -18094,10 +18200,15 @@ def test_step11_default_report_builder_derives_frozen_identity_and_lifecycle() -
     assert report.gguf_identity.manifest_sha256 == report.model_manifest_sha256
     assert report.llama_release == llama_slice.LLAMA_CPP_RELEASE_TAG
     assert report.llama_flags[0:2] == ("--model", "<verified-model>")
-    assert report.llama_flags[-3:] == (
-        "<redacted-key-file>",
+    assert report.llama_flags[-8:] == (
         "--n-gpu-layers",
         "auto",
+        "--verbosity",
+        "4",
+        "--no-log-prefix",
+        "--no-log-timestamps",
+        "--log-colors",
+        "off",
     )
     assert not any("\\" in value or ":/" in value for value in report.llama_flags)
     assert report.gpu_offload == report.cuda_run.session.startup.gpu_offload
