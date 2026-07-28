@@ -10675,12 +10675,23 @@ def _start_llama_process_atomic_windows(
         if process_information.process_id not in process_ids:
             _raise_llama_lifecycle_error("membership_failed")
         assert supervisor_process_id is not None
-        _require_exact_llama_console_process_ids(
-            api=api,
-            expected_process_ids=frozenset(
-                (supervisor_process_id, process_information.process_id)
-            ),
+        expected_live_console_process_ids = frozenset(
+            (supervisor_process_id, process_information.process_id)
         )
+        if type(validated) is LlamaOneShotProbeCommand:
+            observed_console_process_ids = frozenset(
+                _query_exact_llama_console_process_ids(api=api)
+            )
+            if observed_console_process_ids not in (
+                frozenset((supervisor_process_id,)),
+                expected_live_console_process_ids,
+            ):
+                _raise_llama_lifecycle_error("console_failed")
+        else:
+            _require_exact_llama_console_process_ids(
+                api=api,
+                expected_process_ids=expected_live_console_process_ids,
+            )
         evidence = LlamaWindowsLaunchEvidence(
             root_process_id=process_information.process_id,
         )

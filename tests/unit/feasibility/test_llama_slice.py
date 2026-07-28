@@ -20076,6 +20076,93 @@ def _step13_verified_probe_command(
     return inputs, lease, command
 
 
+def test_step13_fast_exit_one_shot_accepts_supervisor_only_postmembership_console(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FastExitConsoleApi(_Step13ProbeApi):
+        def get_console_process_ids(self, *, maximum_ids: int) -> tuple[int, ...]:
+            process_ids = super().get_console_process_ids(maximum_ids=maximum_ids)
+            if self.private_console_allocated and self.child_created:
+                return (self.supervisor_process_id,)
+            return process_ids
+
+    _inputs, lease, command = _step13_verified_probe_command(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        probe_kind="version",
+    )
+    api = _FastExitConsoleApi(
+        stdout_items=[b"version: 10007 (00e79f6f)\n", b""],
+        stderr_items=[b"", b""],
+    )
+
+    result = llama_slice.run_llama_one_shot_windows_probe(
+        api=api,  # type: ignore[arg-type]
+        command=command,
+        clock=_Step13Clock(),  # type: ignore[arg-type]
+        wait_strategy=_Step9WaitStrategy(),  # type: ignore[arg-type]
+    )
+
+    assert result.probe_kind == "version"
+    assert result.combined_output == b"version: 10007 (00e79f6f)\n\n"
+    membership_index = api.events.index(("query-job", (101, 4_096)))
+    postmembership_console_index = max(
+        index
+        for index, (event, _value) in enumerate(api.events)
+        if event == "console-process-ids"
+    )
+    assert membership_index < postmembership_console_index
+    assert ("terminate-job", (101, 1)) not in api.events
+    assert ("ctrl-c", 0) not in api.events
+    assert api.events[-1] == ("free-console", None)
+    assert lease.state == "released"
+
+
+@pytest.mark.parametrize(
+    "postmembership_console_process_ids",
+    [
+        (),
+        (7_777, 8_888),
+        (4_242,),
+        (7_777, 4_242, 8_888),
+    ],
+    ids=("empty", "foreign", "missing-supervisor", "extra"),
+)
+def test_step13_one_shot_rejects_every_other_postmembership_console_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    postmembership_console_process_ids: tuple[int, ...],
+) -> None:
+    class _InvalidPostmembershipConsoleApi(_Step13ProbeApi):
+        def get_console_process_ids(self, *, maximum_ids: int) -> tuple[int, ...]:
+            process_ids = super().get_console_process_ids(maximum_ids=maximum_ids)
+            if self.private_console_allocated and self.child_created:
+                return postmembership_console_process_ids
+            return process_ids
+
+    _inputs, lease, command = _step13_verified_probe_command(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        probe_kind="version",
+    )
+    api = _InvalidPostmembershipConsoleApi()
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.run_llama_one_shot_windows_probe(
+            api=api,  # type: ignore[arg-type]
+            command=command,
+            clock=_Step13Clock(),  # type: ignore[arg-type]
+            wait_strategy=_Step9WaitStrategy(),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == "console_failed"
+    assert ("terminate-job", (101, 1)) in api.events
+    assert ("ctrl-c", 0) not in api.events
+    assert api.events[-1] == ("free-console", None)
+    assert lease.state == "released"
+
+
 @pytest.mark.parametrize(
     ("probe_kind", "flag"),
     [("version", "--version"), ("list_devices", "--list-devices")],
