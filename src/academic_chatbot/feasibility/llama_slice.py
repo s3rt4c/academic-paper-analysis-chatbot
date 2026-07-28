@@ -133,8 +133,10 @@ LLAMA_WINDOWS_STARTUPINFOEX_SIZE = 112
 LLAMA_WINDOWS_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 LLAMA_WINDOWS_FORCED_CLEANUP_TIMEOUT_SECONDS = 15.0
 LLAMA_WINDOWS_STARTUP_TIMEOUT_SECONDS = 300.0
+LLAMA_WINDOWS_CONSOLE_ATTACH_TIMEOUT_SECONDS = 2.0
 LLAMA_ONE_SHOT_PROBE_TIMEOUT_SECONDS = 30.0
 LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS = 0.05
+MAX_LLAMA_WINDOWS_CONSOLE_ATTACH_POLLS = 40
 MAX_LLAMA_WINDOWS_STARTUP_POLLS = 6_001
 MAX_LLAMA_ONE_SHOT_PROBE_POLLS = 601
 MAX_LLAMA_WINDOWS_LIFECYCLE_POLLS = 301
@@ -10417,6 +10419,127 @@ def _require_exact_llama_console_process_ids(
         _raise_llama_lifecycle_error("console_failed")
 
 
+def _require_llama_server_console_attachment(
+    *,
+    api: LlamaWindowsProcessApi,
+    process_handle: int,
+    supervisor_process_id: int,
+    root_process_id: int,
+) -> None:
+    expected_process_ids = frozenset((supervisor_process_id, root_process_id))
+    supervisor_only_process_ids = frozenset((supervisor_process_id,))
+    observed_process_ids = frozenset(
+        _query_exact_llama_console_process_ids(api=api)
+    )
+    if observed_process_ids == expected_process_ids:
+        return
+    if observed_process_ids != supervisor_only_process_ids:
+        _raise_llama_lifecycle_error("console_failed")
+
+    try:
+        started = time.monotonic()
+    except MemoryError:
+        raise
+    except Exception:
+        _raise_llama_lifecycle_error("console_failed")
+    if type(started) is not float or not math.isfinite(started) or started < 0.0:
+        _raise_llama_lifecycle_error("console_failed")
+    deadline = started + LLAMA_WINDOWS_CONSOLE_ATTACH_TIMEOUT_SECONDS
+    if not math.isfinite(deadline):
+        _raise_llama_lifecycle_error("console_failed")
+    previous_observed = started
+
+    for _attempt in range(MAX_LLAMA_WINDOWS_CONSOLE_ATTACH_POLLS):
+        try:
+            exited = api.wait_process(
+                process_handle=process_handle,
+                timeout_seconds=0.0,
+            )
+        except MemoryError:
+            raise
+        except Exception:
+            _raise_llama_lifecycle_error("console_failed")
+        if type(exited) is not bool or exited:
+            _raise_llama_lifecycle_error("console_failed")
+
+        try:
+            observed = time.monotonic()
+        except MemoryError:
+            raise
+        except Exception:
+            _raise_llama_lifecycle_error("console_failed")
+        if (
+            type(observed) is not float
+            or not math.isfinite(observed)
+            or observed < previous_observed
+            or observed >= deadline
+        ):
+            _raise_llama_lifecycle_error("console_failed")
+        previous_observed = observed
+        try:
+            time.sleep(
+                min(
+                    LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS,
+                    deadline - observed,
+                )
+            )
+        except MemoryError:
+            raise
+        except Exception:
+            _raise_llama_lifecycle_error("console_failed")
+
+        try:
+            observed = time.monotonic()
+        except MemoryError:
+            raise
+        except Exception:
+            _raise_llama_lifecycle_error("console_failed")
+        if (
+            type(observed) is not float
+            or not math.isfinite(observed)
+            or observed < previous_observed
+            or observed >= deadline
+        ):
+            _raise_llama_lifecycle_error("console_failed")
+        previous_observed = observed
+
+        try:
+            exited = api.wait_process(
+                process_handle=process_handle,
+                timeout_seconds=0.0,
+            )
+        except MemoryError:
+            raise
+        except Exception:
+            _raise_llama_lifecycle_error("console_failed")
+        if type(exited) is not bool or exited:
+            _raise_llama_lifecycle_error("console_failed")
+
+        observed_process_ids = frozenset(
+            _query_exact_llama_console_process_ids(api=api)
+        )
+        try:
+            observed = time.monotonic()
+        except MemoryError:
+            raise
+        except Exception:
+            _raise_llama_lifecycle_error("console_failed")
+        if (
+            type(observed) is not float
+            or not math.isfinite(observed)
+            or observed < previous_observed
+            or observed >= deadline
+        ):
+            _raise_llama_lifecycle_error("console_failed")
+        previous_observed = observed
+        if observed_process_ids == expected_process_ids:
+            return
+        if observed_process_ids != supervisor_only_process_ids:
+            _raise_llama_lifecycle_error("console_failed")
+
+    _raise_llama_lifecycle_error("console_failed")
+
+
 def _start_llama_process_atomic_windows(
     *,
     api: LlamaWindowsProcessApi,
@@ -10688,9 +10811,11 @@ def _start_llama_process_atomic_windows(
             ):
                 _raise_llama_lifecycle_error("console_failed")
         else:
-            _require_exact_llama_console_process_ids(
+            _require_llama_server_console_attachment(
                 api=api,
-                expected_process_ids=expected_live_console_process_ids,
+                process_handle=process_information.process_handle,
+                supervisor_process_id=supervisor_process_id,
+                root_process_id=process_information.process_id,
             )
         evidence = LlamaWindowsLaunchEvidence(
             root_process_id=process_information.process_id,

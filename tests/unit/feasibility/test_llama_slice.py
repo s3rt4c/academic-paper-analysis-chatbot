@@ -11988,7 +11988,9 @@ def test_step10_windows_lifecycle_constants_are_exact() -> None:
     assert llama_slice.LLAMA_WINDOWS_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS == 15.0
     assert llama_slice.LLAMA_WINDOWS_FORCED_CLEANUP_TIMEOUT_SECONDS == 15.0
     assert llama_slice.LLAMA_WINDOWS_STARTUP_TIMEOUT_SECONDS == 300.0
+    assert llama_slice.LLAMA_WINDOWS_CONSOLE_ATTACH_TIMEOUT_SECONDS == 2.0
     assert llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS == 0.05
+    assert llama_slice.MAX_LLAMA_WINDOWS_CONSOLE_ATTACH_POLLS == 40
     assert llama_slice.MAX_LLAMA_WINDOWS_JOB_PROCESS_IDS == 4_096
     assert llama_slice.MAX_LLAMA_WINDOWS_JOB_QUERY_RETRIES == 8
 
@@ -12266,6 +12268,352 @@ def test_step10_creation_flags_reject_new_process_group_bit() -> None:
 
     assert raised.value.code == "invalid_configuration"
     assert raised.value.__context__ is None
+
+
+class _Step10AsyncConsoleApi(_Step10AtomicApi):
+    def __init__(
+        self,
+        *,
+        post_child_console_sets: list[tuple[int, ...]],
+        zero_wait_results: list[bool] | None = None,
+    ) -> None:
+        super().__init__()
+        self.post_child_console_sets = post_child_console_sets
+        self.zero_wait_results = [] if zero_wait_results is None else zero_wait_results
+
+    def get_console_process_ids(self, *, maximum_ids: int) -> tuple[int, ...]:
+        process_ids = super().get_console_process_ids(maximum_ids=maximum_ids)
+        if self.private_console_allocated and self.child_created:
+            if not self.post_child_console_sets:
+                raise AssertionError("console attach poll exceeded its supplied snapshots")
+            return self.post_child_console_sets.pop(0)
+        return process_ids
+
+    def wait_process(self, *, process_handle: int, timeout_seconds: float) -> bool:
+        self.events.append(("wait-process", (process_handle, timeout_seconds)))
+        if timeout_seconds == 0.0:
+            if not self.zero_wait_results:
+                raise AssertionError("root liveness poll exceeded its supplied results")
+            return self.zero_wait_results.pop(0)
+        return True
+
+
+def test_step10_server_initial_exact_console_attachment_needs_no_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_monotonic() -> NoReturn:
+        raise AssertionError("exact initial attachment must not read the poll clock")
+
+    def unexpected_sleep(_seconds: float) -> NoReturn:
+        raise AssertionError("exact initial attachment must not sleep")
+
+    monkeypatch.setattr(llama_slice.time, "monotonic", unexpected_monotonic)
+    monkeypatch.setattr(llama_slice.time, "sleep", unexpected_sleep)
+    api = _Step10AtomicApi()
+
+    process = llama_slice.start_llama_server_atomic_windows(
+        api=api,  # type: ignore[arg-type]
+        command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+    )
+
+    assert process.process_id == 4_242
+    assert not any(
+        event == "wait-process" and cast(tuple[int, float], value)[1] == 0.0
+        for event, value in api.events
+    )
+
+
+@pytest.mark.parametrize(
+    "post_child_console_process_ids",
+    [
+        (),
+        (4_242,),
+        (7_777, 8_888),
+        (7_777, 4_242, 8_888),
+    ],
+    ids=("empty", "root-only", "foreign", "extra"),
+)
+def test_step10_server_initial_invalid_console_set_fails_without_polling(
+    monkeypatch: pytest.MonkeyPatch,
+    post_child_console_process_ids: tuple[int, ...],
+) -> None:
+    monkeypatch.setattr(llama_slice.time, "monotonic", lambda: 100.0)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(llama_slice.time, "sleep", sleep_calls.append)
+    api = _Step10AsyncConsoleApi(
+        post_child_console_sets=[post_child_console_process_ids],
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.start_llama_server_atomic_windows(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+        )
+
+    assert raised.value.code == "console_failed"
+    assert not any(
+        event == "wait-process" and cast(tuple[int, float], value)[1] == 0.0
+        for event, value in api.events
+    )
+    assert sleep_calls == []
+    assert ("terminate-job", (101, 1)) in api.events
+
+
+@pytest.mark.parametrize(
+    ("post_child_console_sets", "poll_count"),
+    [
+        ([(7_777,), (7_777, 4_242)], 1),
+        ([(7_777,), (7_777,), (7_777, 4_242)], 2),
+    ],
+    ids=("one-poll", "two-polls"),
+)
+def test_step10_server_console_attachment_can_complete_after_bounded_polls(
+    monkeypatch: pytest.MonkeyPatch,
+    post_child_console_sets: list[tuple[int, ...]],
+    poll_count: int,
+) -> None:
+    ticks = iter(100.0 + index * 0.01 for index in range(32))
+    monkeypatch.setattr(llama_slice.time, "monotonic", lambda: next(ticks))
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(llama_slice.time, "sleep", sleep_calls.append)
+    api = _Step10AsyncConsoleApi(
+        post_child_console_sets=post_child_console_sets,
+        zero_wait_results=[False] * (poll_count * 2),
+    )
+
+    process = llama_slice.start_llama_server_atomic_windows(
+        api=api,  # type: ignore[arg-type]
+        command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+    )
+
+    assert process.process_id == 4_242
+    assert sleep_calls == [
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS
+    ] * poll_count
+    assert [
+        value
+        for event, value in api.events
+        if event == "wait-process" and cast(tuple[int, float], value)[1] == 0.0
+    ] == [(107, 0.0)] * (poll_count * 2)
+
+
+def test_step10_server_console_attach_root_early_exit_fails_before_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llama_slice.time, "monotonic", lambda: 100.0)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(llama_slice.time, "sleep", sleep_calls.append)
+    api = _Step10AsyncConsoleApi(
+        post_child_console_sets=[(7_777,)],
+        zero_wait_results=[True],
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.start_llama_server_atomic_windows(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+        )
+
+    assert raised.value.code == "console_failed"
+    assert sleep_calls == []
+    assert ("terminate-job", (101, 1)) in api.events
+
+
+def test_step10_server_console_attach_foreign_pid_fails_on_first_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter(
+        [100.0, 100.01, 100.06, 100.07]
+        + [200.0 + index * 0.01 for index in range(64)]
+    )
+    monkeypatch.setattr(llama_slice.time, "monotonic", lambda: next(ticks))
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(llama_slice.time, "sleep", sleep_calls.append)
+    api = _Step10AsyncConsoleApi(
+        post_child_console_sets=[(7_777,), (7_777, 8_888)],
+        zero_wait_results=[False, False],
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.start_llama_server_atomic_windows(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+        )
+
+    assert raised.value.code == "console_failed"
+    assert sleep_calls == [
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS
+    ]
+    assert ("terminate-job", (101, 1)) in api.events
+
+
+def test_step10_server_console_attach_deadline_exhaustion_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter(
+        [100.0, 100.01, 102.0]
+        + [200.0 + index * 0.01 for index in range(64)]
+    )
+    monkeypatch.setattr(llama_slice.time, "monotonic", lambda: next(ticks))
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(llama_slice.time, "sleep", sleep_calls.append)
+    api = _Step10AsyncConsoleApi(
+        post_child_console_sets=[(7_777,)],
+        zero_wait_results=[False],
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.start_llama_server_atomic_windows(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+        )
+
+    assert raised.value.code == "console_failed"
+    assert sleep_calls == [
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS
+    ]
+    assert ("terminate-job", (101, 1)) in api.events
+
+
+def test_step10_server_exact_console_query_crossing_deadline_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    query_completed = False
+    post_query_clock_reads = 0
+    cleanup_tick = 200.0
+    pre_query_ticks = iter((100.0, 100.01, 100.06))
+
+    def controlled_monotonic() -> float:
+        nonlocal cleanup_tick, post_query_clock_reads
+        if query_completed:
+            post_query_clock_reads += 1
+            if post_query_clock_reads == 1:
+                return 102.0
+            cleanup_tick += 0.01
+            return cleanup_tick
+        return next(pre_query_ticks)
+
+    class _DeadlineCrossingExactQueryApi(_Step10AsyncConsoleApi):
+        def get_console_process_ids(self, *, maximum_ids: int) -> tuple[int, ...]:
+            nonlocal query_completed
+            process_ids = super().get_console_process_ids(maximum_ids=maximum_ids)
+            if (
+                self.private_console_allocated
+                and self.child_created
+                and process_ids == (7_777, 4_242)
+            ):
+                query_completed = True
+            return process_ids
+
+    monkeypatch.setattr(llama_slice.time, "monotonic", controlled_monotonic)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(llama_slice.time, "sleep", sleep_calls.append)
+    api = _DeadlineCrossingExactQueryApi(
+        post_child_console_sets=[(7_777,), (7_777, 4_242)],
+        zero_wait_results=[False, False],
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.start_llama_server_atomic_windows(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+        )
+
+    assert raised.value.code == "console_failed"
+    assert post_query_clock_reads >= 1
+    assert sleep_calls == [
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS
+    ]
+    assert ("terminate-job", (101, 1)) in api.events
+
+
+def test_step10_server_console_attach_retains_finite_hard_poll_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llama_slice, "MAX_LLAMA_WINDOWS_CONSOLE_ATTACH_POLLS", 2)
+    monkeypatch.setattr(llama_slice.time, "monotonic", lambda: 100.0)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(llama_slice.time, "sleep", sleep_calls.append)
+    api = _Step10AsyncConsoleApi(
+        post_child_console_sets=[(7_777,), (7_777,), (7_777,)],
+        zero_wait_results=[False] * 4,
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.start_llama_server_atomic_windows(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+        )
+
+    assert raised.value.code == "console_failed"
+    assert sleep_calls == [
+        llama_slice.LLAMA_WINDOWS_LIFECYCLE_POLL_INTERVAL_SECONDS
+    ] * 2
+    assert ("terminate-job", (101, 1)) in api.events
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["clock", "sleep", "wait", "query"],
+)
+def test_step10_server_console_attach_poll_dependency_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    monotonic_calls = 0
+
+    def controlled_monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        if failure_stage == "clock" and monotonic_calls == 2:
+            return math.nan
+        return 100.0 + monotonic_calls * 0.01
+
+    def controlled_sleep(_seconds: float) -> None:
+        if failure_stage == "sleep":
+            raise OSError("SECRET-SLEEP")
+
+    class _FailingAttachApi(_Step10AsyncConsoleApi):
+        def __init__(self) -> None:
+            super().__init__(
+                post_child_console_sets=[(7_777,), (7_777, 4_242)],
+                zero_wait_results=[False, False],
+            )
+            self.zero_wait_calls = 0
+            self.post_child_query_calls = 0
+
+        def wait_process(self, *, process_handle: int, timeout_seconds: float) -> bool:
+            if timeout_seconds == 0.0:
+                self.zero_wait_calls += 1
+                if failure_stage == "wait" and self.zero_wait_calls == 1:
+                    raise OSError("SECRET-WAIT")
+            return super().wait_process(
+                process_handle=process_handle,
+                timeout_seconds=timeout_seconds,
+            )
+
+        def get_console_process_ids(self, *, maximum_ids: int) -> tuple[int, ...]:
+            if self.private_console_allocated and self.child_created:
+                self.post_child_query_calls += 1
+                if failure_stage == "query" and self.post_child_query_calls == 2:
+                    self.events.append(("console-process-ids", maximum_ids))
+                    raise OSError("SECRET-QUERY")
+            return super().get_console_process_ids(maximum_ids=maximum_ids)
+
+    monkeypatch.setattr(llama_slice.time, "monotonic", controlled_monotonic)
+    monkeypatch.setattr(llama_slice.time, "sleep", controlled_sleep)
+    api = _FailingAttachApi()
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice.start_llama_server_atomic_windows(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+        )
+
+    assert raised.value.code == "console_failed"
+    assert raised.value.__context__ is None
+    assert "SECRET-" not in str(raised.value)
+    assert ("terminate-job", (101, 1)) in api.events
 
 
 def test_step10_nested_job_success_uses_creation_time_job_list_without_breakaway() -> None:
@@ -20091,6 +20439,15 @@ def test_step13_fast_exit_one_shot_accepts_supervisor_only_postmembership_consol
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         probe_kind="version",
+    )
+
+    def unexpected_server_attach(**_kwargs: object) -> NoReturn:
+        raise AssertionError("one-shot probes must not use server console polling")
+
+    monkeypatch.setattr(
+        llama_slice,
+        "_require_llama_server_console_attachment",
+        unexpected_server_attach,
     )
     api = _FastExitConsoleApi(
         stdout_items=[b"version: 10007 (00e79f6f)\n", b""],
