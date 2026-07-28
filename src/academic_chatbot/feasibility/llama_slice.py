@@ -15846,7 +15846,7 @@ class _LlamaCancellationSseDetector:
             if (
                 type(content) is not str
                 or type(id_slot) is not int
-                or id_slot != 0
+                or id_slot != -1
                 or type(index) is not int
                 or index != 0
                 or stop is not False

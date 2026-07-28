@@ -10549,13 +10549,14 @@ class _Step9BlockingCancellationResponse(_Step8HttpResponse):
 def _step9_partial_data_line(
     *,
     content: str = " TEST",
+    id_slot: object = -1,
     token_ids: tuple[int, ...] = (123,),
     tokens_evaluated: int = 64,
     tokens_predicted: int = 1,
 ) -> bytes:
     payload = {
         "content": content,
-        "id_slot": 0,
+        "id_slot": id_slot,
         "index": 0,
         "stop": False,
         "tokens": list(token_ids),
@@ -10635,6 +10636,7 @@ def _step9_b10007_generation_settings() -> dict[str, object]:
 def _step9_b10007_final_data_line(
     *,
     generation_settings: dict[str, object] | None = None,
+    id_slot: object = 0,
     tokens_cached: int = 1_087,
     tokens_evaluated: int = 64,
     tokens_predicted: int = 1_024,
@@ -10643,7 +10645,7 @@ def _step9_b10007_final_data_line(
         "index": 0,
         "content": "",
         "tokens": [],
-        "id_slot": 0,
+        "id_slot": id_slot,
         "stop": True,
         "model": "local-academic",
         "tokens_predicted": tokens_predicted,
@@ -10685,7 +10687,7 @@ def test_step9_cancellation_detector_accepts_exact_b10007_partial_event() -> Non
     )
     detector.feed_line(
         b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
-        b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+        b'"id_slot":-1,"tokens_predicted":1,"tokens_evaluated":64}'
     )
 
     detector.feed_line(b"")
@@ -10694,6 +10696,24 @@ def test_step9_cancellation_detector_accepts_exact_b10007_partial_event() -> Non
     assert first_content.is_set()
     assert state_changed.is_set()
     assert not detector.completed
+
+
+@pytest.mark.parametrize(
+    "id_slot",
+    [0, 1, -2, True],
+    ids=("zero", "positive", "negative-other", "bool"),
+)
+def test_step9_cancellation_detector_rejects_nonexact_b10007_partial_slot(
+    id_slot: object,
+) -> None:
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(_step9_partial_data_line(id_slot=id_slot))
+
+    with pytest.raises(ValueError, match="partial"):
+        detector.feed_line(b"")
 
 
 def test_step9_cancellation_detector_accepts_b10007_heartbeats_before_between_and_consecutive() -> (
@@ -10713,14 +10733,14 @@ def test_step9_cancellation_detector_accepts_b10007_heartbeats_before_between_an
         b"",
         (
             b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
-            b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+            b'"id_slot":-1,"tokens_predicted":1,"tokens_evaluated":64}'
         ),
         b"",
         b":",
         b"",
         (
             b'data: {"index":0,"content":" TEST","tokens":[124],"stop":false,'
-            b'"id_slot":0,"tokens_predicted":2,"tokens_evaluated":64}'
+            b'"id_slot":-1,"tokens_predicted":2,"tokens_evaluated":64}'
         ),
         b"",
     ):
@@ -10741,13 +10761,13 @@ def test_step9_cancellation_detector_accepts_b10007_heartbeats_before_between_an
             b":",
             (
                 b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
-                b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+                b'"id_slot":-1,"tokens_predicted":1,"tokens_evaluated":64}'
             ),
         ),
         (
             (
                 b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
-                b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+                b'"id_slot":-1,"tokens_predicted":1,"tokens_evaluated":64}'
             ),
             b":",
         ),
@@ -10785,7 +10805,7 @@ def test_step9_cancellation_detector_counts_heartbeat_toward_event_bound(
     detector.feed_line(b"")
     detector.feed_line(
         b'data: {"index":0,"content":" TEST","tokens":[123],"stop":false,'
-        b'"id_slot":0,"tokens_predicted":1,"tokens_evaluated":64}'
+        b'"id_slot":-1,"tokens_predicted":1,"tokens_evaluated":64}'
     )
 
     with pytest.raises(ValueError, match="event count"):
@@ -10939,6 +10959,19 @@ def test_step9_cancellation_detector_accepts_source_shaped_b10007_final_settings
     assert detector.completed
     assert detector.event_count == 1
     assert not detector.first_content_observed
+
+
+def test_step9_cancellation_detector_rejects_partial_slot_sentinel_on_final_event() -> (
+    None
+):
+    detector = llama_slice._LlamaCancellationSseDetector(
+        first_content_event=threading.Event(),
+        state_changed_event=threading.Event(),
+    )
+    detector.feed_line(_step9_b10007_final_data_line(id_slot=-1))
+
+    with pytest.raises(ValueError, match="final"):
+        detector.feed_line(b"")
 
 
 @pytest.mark.parametrize(
@@ -11818,22 +11851,22 @@ def test_step9_disconnect_cancellation_reader_deadlock_is_terminal(
     [
         (
             b'data: {"index":0,"content":"SECRET-CANCEL-RAW","tokens":[1],'
-            b'"stop":false,"id_slot":0,"tokens_predicted":1,'
+            b'"stop":false,"id_slot":-1,"tokens_predicted":1,'
             b'"tokens_evaluated":64,"extra":0}\n\n'
         ),
         (
             b'data: {"index":0,"content":"SECRET-CANCEL-RAW","content":"x",'
-            b'"tokens":[1],"stop":false,"id_slot":0,"tokens_predicted":1,'
+            b'"tokens":[1],"stop":false,"id_slot":-1,"tokens_predicted":1,'
             b'"tokens_evaluated":64}\n\n'
         ),
         (
             b'data: {"index":0,"content":"SECRET-CANCEL-RAW","tokens":[1],'
-            b'"stop":false,"id_slot":0,"tokens_predicted":1,'
+            b'"stop":false,"id_slot":-1,"tokens_predicted":1,'
             b'"tokens_evaluated":64}\r\n\n'
         ),
         (
             b'data: {"index":0,"content":"SECRET-CANCEL-RAW","tokens":[true],'
-            b'"stop":false,"id_slot":0,"tokens_predicted":1,'
+            b'"stop":false,"id_slot":-1,"tokens_predicted":1,'
             b'"tokens_evaluated":64}\n\n'
         ),
         b":\n",
