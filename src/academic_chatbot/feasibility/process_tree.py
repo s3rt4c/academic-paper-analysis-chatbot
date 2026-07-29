@@ -273,11 +273,19 @@ class ProcessTreePeakSampler:
                 if not child.is_running():
                     self._record_churn()
                     continue
-                total_bytes += self._read_memory(child)
             except (psutil.NoSuchProcess, ProcessLookupError):
                 self._record_churn()
             except Exception:
                 self._record_access_error()
+            else:
+                try:
+                    total_bytes += self._read_memory(child)
+                except (psutil.NoSuchProcess, ProcessLookupError):
+                    self._record_churn()
+                except (psutil.AccessDenied, PermissionError):
+                    self._record_child_memory_access_error(child)
+                except Exception:
+                    self._record_access_error()
 
         self._record_peak(total_bytes)
 
@@ -292,6 +300,19 @@ class ProcessTreePeakSampler:
         if isinstance(value, bool) or value < 0:
             raise ValueError("Process memory bytes must be non-negative.")
         return value
+
+    def _record_child_memory_access_error(self, child: _ProcessLike) -> None:
+        try:
+            recheck = child.is_running()
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            self._record_churn()
+        except Exception:
+            self._record_access_error()
+        else:
+            if recheck is False:
+                self._record_churn()
+            else:
+                self._record_access_error()
 
     def _record_peak(self, sample_bytes: int) -> None:
         with self._lock:

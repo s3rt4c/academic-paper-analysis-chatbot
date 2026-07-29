@@ -19,7 +19,7 @@ from academic_chatbot.feasibility.process_tree import (
 class _ProcessState:
     uss: int | BaseException
     rss: int | BaseException
-    running: bool | BaseException = True
+    running: bool | BaseException | tuple[bool | BaseException, ...] = True
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,7 @@ class _FakeProcess:
     def __init__(self, pid: int, snapshots: _Snapshots) -> None:
         self.pid = pid
         self._snapshots = snapshots
+        self._running_call_count = 0
 
     def children(self, *, recursive: bool) -> list[_FakeProcess]:
         assert recursive is True
@@ -62,6 +63,9 @@ class _FakeProcess:
 
     def is_running(self) -> bool:
         value = self._state().running
+        if isinstance(value, tuple):
+            value = value[min(self._running_call_count, len(value) - 1)]
+            self._running_call_count += 1
         if isinstance(value, BaseException):
             raise value
         return value
@@ -433,18 +437,160 @@ def test_zombie_child_counts_as_churn_without_invalidating_measurement() -> None
     assert result.measurement_valid is True
 
 
-def test_access_denied_for_child_invalidates_measurement() -> None:
+@pytest.mark.parametrize(
+    "memory_error",
+    [psutil.AccessDenied(2), PermissionError()],
+)
+def test_child_memory_access_error_with_live_recheck_invalidates_measurement(
+    memory_error: BaseException,
+) -> None:
     result, _, _ = _run_three_samples(
         (
             _Snapshot({1: _state(100)}),
             _Snapshot(
-                {1: _state(120), 2: _ProcessState(uss=psutil.AccessDenied(2), rss=20)},
+                {
+                    1: _state(120),
+                    2: _ProcessState(
+                        uss=memory_error,
+                        rss=20,
+                        running=(True, True),
+                    ),
+                },
                 descendants=(2,),
             ),
             _Snapshot({1: _state(90)}),
         )
     )
 
+    assert result.peak_bytes == 120
+    assert result.process_churn_count == 0
+    assert result.access_error_count == 1
+    assert result.measurement_valid is False
+
+
+@pytest.mark.parametrize(
+    ("memory_error", "stopped_recheck"),
+    [
+        (psutil.AccessDenied(2), False),
+        (psutil.AccessDenied(2), psutil.NoSuchProcess(2)),
+        (psutil.AccessDenied(2), ProcessLookupError()),
+        (PermissionError(), False),
+        (PermissionError(), psutil.NoSuchProcess(2)),
+        (PermissionError(), ProcessLookupError()),
+    ],
+)
+def test_child_memory_access_error_after_confirmed_exit_counts_as_churn(
+    memory_error: BaseException,
+    stopped_recheck: bool | BaseException,
+) -> None:
+    result, _, _ = _run_three_samples(
+        (
+            _Snapshot({1: _state(100)}),
+            _Snapshot(
+                {
+                    1: _state(120),
+                    2: _ProcessState(
+                        uss=memory_error,
+                        rss=20,
+                        running=(True, stopped_recheck),
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _state(90)}),
+        )
+    )
+
+    assert result.peak_bytes == 120
+    assert result.process_churn_count == 1
+    assert result.access_error_count == 0
+    assert result.measurement_valid is True
+
+
+@pytest.mark.parametrize(
+    ("memory_error", "recheck_error"),
+    [
+        (psutil.AccessDenied(2), psutil.AccessDenied(2)),
+        (psutil.AccessDenied(2), PermissionError()),
+        (psutil.AccessDenied(2), RuntimeError()),
+        (PermissionError(), psutil.AccessDenied(2)),
+        (PermissionError(), PermissionError()),
+        (PermissionError(), RuntimeError()),
+    ],
+)
+def test_child_memory_access_error_with_uncertain_recheck_invalidates_measurement(
+    memory_error: BaseException,
+    recheck_error: BaseException,
+) -> None:
+    result, _, _ = _run_three_samples(
+        (
+            _Snapshot({1: _state(100)}),
+            _Snapshot(
+                {
+                    1: _state(120),
+                    2: _ProcessState(
+                        uss=memory_error,
+                        rss=20,
+                        running=(True, recheck_error),
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _state(90)}),
+        )
+    )
+
+    assert result.peak_bytes == 120
+    assert result.process_churn_count == 0
+    assert result.access_error_count == 1
+    assert result.measurement_valid is False
+
+
+@pytest.mark.parametrize(
+    "initial_running_error",
+    [psutil.AccessDenied(2), PermissionError()],
+)
+def test_initial_child_running_access_error_invalidates_without_memory_recheck(
+    initial_running_error: BaseException,
+) -> None:
+    result, _, _ = _run_three_samples(
+        (
+            _Snapshot({1: _state(100)}),
+            _Snapshot(
+                {
+                    1: _state(120),
+                    2: _ProcessState(
+                        uss=20,
+                        rss=20,
+                        running=initial_running_error,
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _state(90)}),
+        )
+    )
+
+    assert result.peak_bytes == 120
+    assert result.process_churn_count == 0
+    assert result.access_error_count == 1
+    assert result.measurement_valid is False
+
+
+def test_children_enumeration_access_denied_invalidates_measurement() -> None:
+    result, _, _ = _run_three_samples(
+        (
+            _Snapshot({1: _state(100)}),
+            _Snapshot(
+                {1: _state(120)},
+                children_error=psutil.AccessDenied(1),
+            ),
+            _Snapshot({1: _state(90)}),
+        )
+    )
+
+    assert result.peak_bytes == 120
+    assert result.process_churn_count == 0
     assert result.access_error_count == 1
     assert result.measurement_valid is False
 
