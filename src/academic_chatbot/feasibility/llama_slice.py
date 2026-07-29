@@ -110,6 +110,7 @@ LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS = 2.0
 LLAMA_HTTP_RECOVERY_COMPLETION_READ_TIMEOUT_SECONDS = 5.0
 LLAMA_HTTP_WRITE_TIMEOUT_SECONDS = 10.0
 LLAMA_HTTP_POOL_TIMEOUT_SECONDS = 2.0
+LLAMA_HTTP_WATCHDOG_JOIN_TIMEOUT_SECONDS = 1.0
 MAX_LLAMA_HTTP_REQUEST_BODY_BYTES = 512 * 1024
 MAX_LLAMA_SLOTS_BODY_BYTES = 64 * 1024
 MAX_LLAMA_COMPLETION_BODY_BYTES = 64 * 1024
@@ -12311,6 +12312,9 @@ def _start_llama_server_windows_session_impl(
             readers=cleanup_readers,
             wait_strategy=wait_strategy,
         )
+    diagnostic_memory_error, diagnostic_base_error, diagnostic_failed = (
+        _zeroize_llama_windows_reader_diagnostics(cleanup_readers)
+    )
     if primary_base_error is not None:
         raise primary_base_error
     if primary_memory_error is not None:
@@ -12321,7 +12325,11 @@ def _start_llama_server_windows_session_impl(
         raise unwind_memory_error
     if process._cleanup_error is not None:
         raise process._cleanup_error
-    if unwind_failed or cleanup_failed:
+    if diagnostic_base_error is not None:
+        raise diagnostic_base_error
+    if diagnostic_memory_error is not None:
+        raise diagnostic_memory_error
+    if unwind_failed or cleanup_failed or diagnostic_failed:
         _raise_llama_lifecycle_error("cleanup_failed")
     _raise_llama_lifecycle_error(primary_code)
 
@@ -14603,15 +14611,106 @@ class _LlamaHttpResourceOwner:
         _close_llama_http_resources(context=context, client=client)
 
 
+class _LlamaHttpDeadlineWatchdog:
+    """Close one HTTP operation at its whole-operation deadline."""
+
+    __slots__ = (
+        "_base_error",
+        "_close_failed",
+        "_expired",
+        "_lock",
+        "_memory_error",
+        "_resource_owner",
+        "_timer",
+    )
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float,
+        resource_owner: _LlamaHttpResourceOwner,
+    ) -> None:
+        if (
+            type(timeout_seconds) is not float
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0.0
+            or type(resource_owner) is not _LlamaHttpResourceOwner
+        ):
+            _raise_llama_http_error("invalid_request")
+        self._resource_owner = resource_owner
+        self._expired = threading.Event()
+        self._base_error: BaseException | None = None
+        self._close_failed = False
+        self._memory_error: MemoryError | None = None
+        self._lock = threading.Lock()
+        self._timer = threading.Timer(timeout_seconds, self._expire)
+        self._timer.daemon = True
+        self._timer.name = "llama-http-operation-deadline"
+
+    @property
+    def expired(self) -> bool:
+        return self._expired.is_set()
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def _record_close_failure(self, error: BaseException) -> None:
+        with self._lock:
+            if isinstance(error, MemoryError):
+                if self._memory_error is None:
+                    self._memory_error = error
+            elif isinstance(error, Exception):
+                self._close_failed = True
+            elif self._base_error is None:
+                self._base_error = error
+
+    def _expire(self) -> None:
+        self._expired.set()
+        try:
+            self._resource_owner.close()
+        except BaseException as error:
+            self._record_close_failure(error)
+
+    def close(self) -> None:
+        failed = False
+        try:
+            self._timer.cancel()
+        except BaseException as error:
+            self._record_close_failure(error)
+            failed = True
+        try:
+            self._timer.join(LLAMA_HTTP_WATCHDOG_JOIN_TIMEOUT_SECONDS)
+            if self._timer.is_alive():
+                failed = True
+        except BaseException as error:
+            self._record_close_failure(error)
+            failed = True
+        try:
+            self._resource_owner.close()
+        except BaseException as error:
+            self._record_close_failure(error)
+            failed = True
+
+        with self._lock:
+            base_error = self._base_error
+            memory_error = self._memory_error
+            failed = failed or self._close_failed
+        if base_error is not None:
+            raise base_error
+        if memory_error is not None:
+            raise memory_error
+        if failed:
+            _raise_llama_http_error("close_failed")
+
+
 class LlamaOwnedHttpStream:
     """Single-use raw response plus its dedicated no-keepalive client."""
 
     __slots__ = (
         "_cleanup_failed",
-        "_client",
         "_closed",
         "_closing",
-        "_context",
+        "_deadline_watchdog",
         "_iterator",
         "_lock",
         "_pending",
@@ -14622,12 +14721,10 @@ class LlamaOwnedHttpStream:
     def __init__(
         self,
         *,
-        client: _LlamaHttpClient,
-        context: _LlamaHttpResponseContext,
+        deadline_watchdog: _LlamaHttpDeadlineWatchdog,
         response: _LlamaHttpResponse,
     ) -> None:
-        self._client = client
-        self._context = context
+        self._deadline_watchdog = deadline_watchdog
         self._iterator = response.iter_raw()
         self._pending = bytearray()
         self._lock = threading.Lock()
@@ -14646,7 +14743,9 @@ class LlamaOwnedHttpStream:
         boundary_failure: LlamaHttpFailureCode | None = None
         iterator: Iterator[bytes] | None = None
         with self._lock:
-            if self._closed or self._closing:
+            if self._deadline_watchdog.expired:
+                boundary_failure = "read_timeout"
+            elif self._closed or self._closing:
                 boundary_failure = "stream_closed"
             elif (
                 type(maximum_bytes) is not int
@@ -14663,6 +14762,8 @@ class LlamaOwnedHttpStream:
                 iterator = self._iterator
         if boundary_failure is not None or iterator is None:
             del self, maximum_bytes, iterator
+            if boundary_failure == "read_timeout":
+                raise LlamaSseStreamTimeout("Llama SSE read timed out.") from None
             _raise_llama_http_error(
                 "http_client_error" if boundary_failure is None else boundary_failure
             )
@@ -14683,6 +14784,10 @@ class LlamaOwnedHttpStream:
             failure = "disconnected"
         except Exception:
             failure = "http"
+        if self._deadline_watchdog.expired:
+            failure = "timeout"
+            chunk = None
+            reached_eof = False
         if not reached_eof and failure is None and memory_error is None:
             if type(chunk) is not bytes or not chunk:
                 failure = "http"
@@ -14759,18 +14864,12 @@ class LlamaOwnedHttpStream:
 
     def close(self) -> None:
         iterator: Iterator[bytes] | None = None
-        context: _LlamaHttpResponseContext | None = None
-        client: _LlamaHttpClient | None = None
         pending: bytearray | None = None
         with self._lock:
             if self._closed or self._closing:
                 return
             self._closing = True
-            context = self._context
-            client = self._client
             pending = self._pending
-            self._context = cast(_LlamaHttpResponseContext, None)
-            self._client = cast(_LlamaHttpClient, None)
             self._pending = bytearray()
             if not self._read_active:
                 iterator = self._iterator
@@ -14788,7 +14887,7 @@ class LlamaOwnedHttpStream:
             except Exception:
                 failed = True
         try:
-            _close_llama_http_resources(context=context, client=client)
+            self._deadline_watchdog.close()
         except MemoryError as error:
             if memory_error is None:
                 memory_error = error
@@ -14805,7 +14904,7 @@ class LlamaOwnedHttpStream:
         if memory_error is not None:
             raise memory_error
         if failed:
-            del self, iterator, context, client, pending
+            del self, iterator, pending
             _raise_llama_http_error("close_failed")
 
 
@@ -15021,36 +15120,52 @@ class LlamaHttpxLoopbackTransport:
         endpoint: Literal["/completion", "/v1/chat/completions"],
         body: bytes,
     ) -> LlamaOwnedHttpStream:
-        client, context, response = self._open_response(
-            method="POST",
-            endpoint=endpoint,
-            body=body,
-            authenticated=True,
-            accept="text/event-stream",
-            allowed_statuses=frozenset({200}),
-            read_timeout_seconds=LLAMA_HTTP_READ_TIMEOUT_SECONDS,
-            operation_timeout_seconds=LLAMA_HTTP_READ_TIMEOUT_SECONDS,
+        resource_owner = _LlamaHttpResourceOwner()
+        watchdog = _LlamaHttpDeadlineWatchdog(
+            timeout_seconds=LLAMA_HTTP_READ_TIMEOUT_SECONDS,
+            resource_owner=resource_owner,
         )
+        failure_code: LlamaHttpFailureCode | None = None
+        memory_error: MemoryError | None = None
         try:
+            watchdog.start()
+            _client, _context, response = self._open_response(
+                method="POST",
+                endpoint=endpoint,
+                body=body,
+                authenticated=True,
+                accept="text/event-stream",
+                allowed_statuses=frozenset({200}),
+                read_timeout_seconds=LLAMA_HTTP_READ_TIMEOUT_SECONDS,
+                operation_timeout_seconds=LLAMA_HTTP_READ_TIMEOUT_SECONDS,
+                resource_owner=resource_owner,
+            )
+            if watchdog.expired:
+                _raise_llama_http_error("read_timeout")
             return LlamaOwnedHttpStream(
-                client=client,
-                context=context,
+                deadline_watchdog=watchdog,
                 response=response,
             )
-        except MemoryError:
-            try:
-                _close_llama_http_resources(context=context, client=client)
-            except Exception:
-                pass
-            raise
-        except Exception:
-            try:
-                _close_llama_http_resources(context=context, client=client)
-            except MemoryError:
-                raise
-            except Exception:
-                pass
-            _raise_llama_http_error("http_client_error")
+        except MemoryError as error:
+            memory_error = error
+        except LlamaSliceHttpError as error:
+            failure_code = error.code
+        except Exception as error:
+            failure_code = _llama_http_failure_code(error)
+        try:
+            watchdog.close()
+        except MemoryError as error:
+            if memory_error is None:
+                memory_error = error
+        except LlamaSliceHttpError:
+            failure_code = "close_failed"
+        if memory_error is not None:
+            raise memory_error
+        if watchdog.expired and failure_code != "close_failed":
+            failure_code = "read_timeout"
+        _raise_llama_http_error(
+            "http_client_error" if failure_code is None else failure_code
+        )
 
     def open_chat_completion(self, body: bytes) -> LlamaOwnedHttpStream:
         try:
@@ -15102,33 +15217,19 @@ class LlamaHttpxLoopbackTransport:
         failure_code: LlamaHttpFailureCode | None = None
         memory_error: MemoryError | None = None
         retained = bytearray()
-        deadline_expired = threading.Event()
-        timer_close_failed = threading.Event()
-        timer_memory_errors: list[MemoryError] = []
         resource_owner = _LlamaHttpResourceOwner()
-        timer: threading.Timer | None = None
-
-        def close_once() -> None:
-            resource_owner.close()
-
-        def expire_operation() -> None:
-            deadline_expired.set()
-            try:
-                close_once()
-            except MemoryError as error:
-                timer_memory_errors.append(error)
-            except Exception:
-                timer_close_failed.set()
+        watchdog: _LlamaHttpDeadlineWatchdog | None = None
 
         try:
             elapsed_seconds = time.monotonic() - operation_started
             remaining_seconds = total_timeout_seconds - elapsed_seconds
             if remaining_seconds <= 0.0:
                 _raise_llama_http_error("read_timeout")
-            timer = threading.Timer(remaining_seconds, expire_operation)
-            timer.daemon = True
-            timer.name = "llama-http-body-deadline"
-            timer.start()
+            watchdog = _LlamaHttpDeadlineWatchdog(
+                timeout_seconds=remaining_seconds,
+                resource_owner=resource_owner,
+            )
+            watchdog.start()
             _client, _context, response = self._open_response(
                 method=method,
                 endpoint=endpoint,
@@ -15140,7 +15241,7 @@ class LlamaHttpxLoopbackTransport:
                 operation_timeout_seconds=total_timeout_seconds,
                 resource_owner=resource_owner,
             )
-            if deadline_expired.is_set():
+            if watchdog.expired:
                 _raise_llama_http_error("read_timeout")
             for chunk in response.iter_raw():
                 if time.monotonic() - operation_started > total_timeout_seconds:
@@ -15162,24 +15263,15 @@ class LlamaHttpxLoopbackTransport:
         except Exception as error:
             failure_code = _llama_http_failure_code(error)
             result = None
-        if timer is not None:
-            timer.cancel()
+        if watchdog is not None:
             try:
-                timer.join()
-            except Exception:
+                watchdog.close()
+            except MemoryError as error:
+                if memory_error is None:
+                    memory_error = error
+            except LlamaSliceHttpError:
                 failure_code = "close_failed"
-        try:
-            close_once()
-        except MemoryError as error:
-            if memory_error is None:
-                memory_error = error
-        except LlamaSliceHttpError:
-            failure_code = "close_failed"
-        if timer_memory_errors and memory_error is None:
-            memory_error = timer_memory_errors[0]
-        if timer_close_failed.is_set():
-            failure_code = "close_failed"
-        elif deadline_expired.is_set() and failure_code != "close_failed":
+        if watchdog is not None and watchdog.expired and failure_code != "close_failed":
             failure_code = "read_timeout"
             result = None
         retained[:] = b"\x00" * len(retained)

@@ -369,6 +369,41 @@ def test_windows_falls_back_to_rss_once_when_uss_is_unavailable_at_startup() -> 
     assert snapshots.rss_calls == [1, 1, 1]
 
 
+@pytest.mark.parametrize(
+    "memory_error",
+    [psutil.AccessDenied(2), PermissionError()],
+)
+def test_rss_fallback_child_memory_access_error_after_confirmed_exit_is_churn(
+    memory_error: BaseException,
+) -> None:
+    unavailable = AttributeError("uss is unavailable")
+    result, snapshots, _ = _run_three_samples(
+        (
+            _Snapshot({1: _ProcessState(uss=unavailable, rss=100)}),
+            _Snapshot(
+                {
+                    1: _ProcessState(uss=999, rss=120),
+                    2: _ProcessState(
+                        uss=999,
+                        rss=memory_error,
+                        running=(True, False),
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _ProcessState(uss=999, rss=90)}),
+        )
+    )
+
+    assert result.metric == "process_tree_sum_rss_bytes"
+    assert result.peak_bytes == 120
+    assert result.process_churn_count == 1
+    assert result.access_error_count == 0
+    assert result.measurement_valid is True
+    assert snapshots.uss_calls == [1]
+    assert snapshots.rss_calls == [1, 1, 2, 1]
+
+
 def test_startup_access_denied_selects_rss_and_invalidates_measurement() -> None:
     frames = (
         _Snapshot({1: _ProcessState(uss=psutil.AccessDenied(1), rss=100)}),

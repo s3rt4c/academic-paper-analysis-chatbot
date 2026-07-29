@@ -16,7 +16,7 @@ import warnings
 import weakref
 import zipfile
 import zlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -10127,6 +10127,296 @@ def test_step8_http_control_deadline_interrupts_blocked_response_headers() -> No
     assert client.close_count == 1
 
 
+def test_step8_http_stream_deadline_interrupts_blocked_response_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llama_slice, "LLAMA_HTTP_READ_TIMEOUT_SECONDS", 0.02)
+
+    class _BlockedEnterResponse(_Step8HttpResponse):
+        def __init__(self) -> None:
+            super().__init__(
+                url="http://127.0.0.1:49152/v1/chat/completions",
+            )
+            self.enter_started = threading.Event()
+            self.release = threading.Event()
+
+        def __enter__(self) -> _Step8HttpResponse:
+            self.enter_count += 1
+            self.enter_started.set()
+            if not self.release.wait(0.15):
+                raise AssertionError("stream header deadline did not close the client")
+            raise httpx.ReadError("EXPECTED-STREAM-HEADER-DEADLINE-DISCONNECT")
+
+    response = _BlockedEnterResponse()
+
+    class _InterruptingClient(_Step8HttpClient):
+        def close(self) -> None:
+            response.release.set()
+            super().close()
+
+    client = _InterruptingClient([response])
+    transport = llama_slice.open_llama_loopback_http_transport(
+        bound_port=49_152,
+        api_key=_STEP8_API_KEY,
+        client_factory=_Step8HttpClientFactory([client]),  # type: ignore[arg-type]
+    )
+
+    started = time.perf_counter()
+    with pytest.raises(llama_slice.LlamaSliceHttpError) as raised:
+        transport.open_chat_completion(b"{}")
+    elapsed = time.perf_counter() - started
+
+    assert raised.value.code == "read_timeout"
+    assert raised.value.__context__ is None
+    assert elapsed < 0.1
+    assert response.enter_started.is_set()
+    assert response.enter_count == 1
+    assert response.close_count == 0
+    assert client.close_count == 1
+
+
+def test_step8_http_stream_deadline_rejects_slow_drip_and_closes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llama_slice, "LLAMA_HTTP_READ_TIMEOUT_SECONDS", 0.03)
+
+    class _SlowDripResponse(_Step8HttpResponse):
+        def __init__(self) -> None:
+            super().__init__(
+                url="http://127.0.0.1:49152/v1/chat/completions",
+            )
+            self.release = threading.Event()
+
+        def iter_raw(self, chunk_size: int | None = None) -> Iterator[bytes]:
+            self.iter_chunk_sizes.append(chunk_size)
+            try:
+                for _index in range(8):
+                    if self.release.wait(0.01):
+                        raise httpx.ReadError("EXPECTED-SLOW-DRIP-DEADLINE-DISCONNECT")
+                    yield b"x"
+            finally:
+                self.iterator_close_count += 1
+
+        def close(self) -> None:
+            self.release.set()
+            super().close()
+
+    response = _SlowDripResponse()
+    client = _Step8HttpClient([response])
+    transport = llama_slice.open_llama_loopback_http_transport(
+        bound_port=49_152,
+        api_key=_STEP8_API_KEY,
+        client_factory=_Step8HttpClientFactory([client]),  # type: ignore[arg-type]
+    )
+    stream = transport.open_chat_completion(b"{}")
+    chunks: list[bytes] = []
+
+    started = time.perf_counter()
+    try:
+        with pytest.raises(llama_slice.LlamaSseStreamTimeout) as raised:
+            while True:
+                chunk = stream.read(llama_slice.LLAMA_SSE_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+    finally:
+        stream.close()
+    elapsed = time.perf_counter() - started
+
+    assert raised.value.__context__ is None
+    assert 0 < len(chunks) < 8
+    assert elapsed < 0.15
+    assert response.iterator_close_count == 1
+    assert response.close_count == 1
+    assert client.close_count == 1
+
+
+def test_step8_http_stream_normal_close_joins_deadline_watchdog_boundedly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timers: list[_RecordingDeadlineTimer] = []
+
+    class _RecordingDeadlineTimer:
+        def __init__(
+            self,
+            interval: float,
+            function: Callable[[], None],
+        ) -> None:
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            self.name = ""
+            self.cancel_count = 0
+            self.join_timeouts: list[float | None] = []
+
+        def start(self) -> None:
+            timers.append(self)
+
+        def cancel(self) -> None:
+            self.cancel_count += 1
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(llama_slice.threading, "Timer", _RecordingDeadlineTimer)
+    response = _Step8HttpResponse(
+        url="http://127.0.0.1:49152/v1/chat/completions",
+        items=[b"unused"],
+    )
+    client = _Step8HttpClient([response])
+    transport = llama_slice.open_llama_loopback_http_transport(
+        bound_port=49_152,
+        api_key=_STEP8_API_KEY,
+        client_factory=_Step8HttpClientFactory([client]),  # type: ignore[arg-type]
+    )
+
+    stream = transport.open_chat_completion(b"{}")
+    stream.close()
+
+    assert len(timers) == 1
+    assert timers[0].cancel_count == 1
+    assert timers[0].join_timeouts == [
+        llama_slice.LLAMA_HTTP_WATCHDOG_JOIN_TIMEOUT_SECONDS
+    ]
+    assert response.close_count == 1
+    assert client.close_count == 1
+
+
+def test_step8_http_control_normal_close_joins_deadline_watchdog_boundedly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timers: list[_RecordingDeadlineTimer] = []
+
+    class _RecordingDeadlineTimer:
+        def __init__(
+            self,
+            interval: float,
+            function: Callable[[], None],
+        ) -> None:
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            self.name = ""
+            self.cancel_count = 0
+            self.join_timeouts: list[float | None] = []
+
+        def start(self) -> None:
+            timers.append(self)
+
+        def cancel(self) -> None:
+            self.cancel_count += 1
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(llama_slice.threading, "Timer", _RecordingDeadlineTimer)
+    response = _Step8HttpResponse(
+        url="http://127.0.0.1:49152/health",
+        headers={"content-type": "application/json; charset=utf-8"},
+        items=[llama_slice.LLAMA_HEALTH_READY_BODY],
+    )
+    client = _Step8HttpClient([response])
+    transport = llama_slice.open_llama_loopback_http_transport(
+        bound_port=49_152,
+        api_key=_STEP8_API_KEY,
+        client_factory=_Step8HttpClientFactory([client]),  # type: ignore[arg-type]
+    )
+
+    assert transport.get_health().body == llama_slice.LLAMA_HEALTH_READY_BODY
+
+    assert len(timers) == 1
+    assert timers[0].cancel_count == 1
+    assert timers[0].join_timeouts == [
+        llama_slice.LLAMA_HTTP_WATCHDOG_JOIN_TIMEOUT_SECONDS
+    ]
+    assert response.close_count == 1
+    assert client.close_count == 1
+
+
+def test_step8_http_stream_watchdog_fails_closed_when_timer_remains_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timers: list[_HungDeadlineTimer] = []
+
+    class _HungDeadlineTimer:
+        def __init__(
+            self,
+            interval: float,
+            function: Callable[[], None],
+        ) -> None:
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            self.name = ""
+            self.cancel_count = 0
+            self.join_timeouts: list[float | None] = []
+
+        def start(self) -> None:
+            timers.append(self)
+
+        def cancel(self) -> None:
+            self.cancel_count += 1
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self) -> bool:
+            return True
+
+    monkeypatch.setattr(llama_slice.threading, "Timer", _HungDeadlineTimer)
+    response = _Step8HttpResponse(
+        url="http://127.0.0.1:49152/v1/chat/completions",
+        items=[b"unused"],
+    )
+    client = _Step8HttpClient([response])
+    transport = llama_slice.open_llama_loopback_http_transport(
+        bound_port=49_152,
+        api_key=_STEP8_API_KEY,
+        client_factory=_Step8HttpClientFactory([client]),  # type: ignore[arg-type]
+    )
+    stream = transport.open_chat_completion(b"{}")
+
+    with pytest.raises(llama_slice.LlamaSliceHttpError) as raised:
+        stream.close()
+
+    assert raised.value.code == "close_failed"
+    assert len(timers) == 1
+    assert timers[0].cancel_count == 1
+    assert timers[0].join_timeouts == [
+        llama_slice.LLAMA_HTTP_WATCHDOG_JOIN_TIMEOUT_SECONDS
+    ]
+    assert response.close_count == 1
+    assert client.close_count == 1
+
+
+def test_step8_http_stream_watchdog_preserves_fatal_close_exception() -> None:
+    marker = KeyboardInterrupt("EXPECTED-STREAM-WATCHDOG-CLOSE-INTERRUPT")
+    response = _Step8HttpResponse(
+        url="http://127.0.0.1:49152/v1/chat/completions",
+        items=[b"unused"],
+    )
+    client = _Step8HttpClient([response], close_error=marker)
+    transport = llama_slice.open_llama_loopback_http_transport(
+        bound_port=49_152,
+        api_key=_STEP8_API_KEY,
+        client_factory=_Step8HttpClientFactory([client]),  # type: ignore[arg-type]
+    )
+    stream = transport.open_chat_completion(b"{}")
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        stream.close()
+
+    assert raised.value is marker
+    assert response.close_count == 1
+    assert client.close_count == 1
+
+
 @pytest.mark.parametrize(
     ("underlying", "code"),
     [
@@ -11306,9 +11596,12 @@ def test_step9_disconnect_cancellation_reader_start_cleanup_failure_is_terminal(
         client_factory=_Step8HttpClientFactory([client]),  # type: ignore[arg-type]
     )
 
+    original_start = threading.Thread.start
+
     def fail_start(self: threading.Thread) -> None:
-        del self
-        raise RuntimeError("SECRET-READER-START-FAILURE")
+        if self.name == "llama-cancellation-reader":
+            raise RuntimeError("SECRET-READER-START-FAILURE")
+        original_start(self)
 
     monkeypatch.setattr(llama_slice.threading.Thread, "start", fail_start)
 
@@ -11782,7 +12075,23 @@ def test_step9_reader_setup_failure_closes_already_open_stream(
     def fail_event() -> NoReturn:
         raise marker
 
-    monkeypatch.setattr(llama_slice.threading, "Event", fail_event)
+    original_open_completion = (
+        llama_slice.LlamaHttpxLoopbackTransport.open_completion
+    )
+
+    def open_completion_then_fail_reader_setup(
+        self: llama_slice.LlamaHttpxLoopbackTransport,
+        body: bytes,
+    ) -> llama_slice.LlamaOwnedHttpStream:
+        stream = original_open_completion(self, body)
+        monkeypatch.setattr(llama_slice.threading, "Event", fail_event)
+        return stream
+
+    monkeypatch.setattr(
+        llama_slice.LlamaHttpxLoopbackTransport,
+        "open_completion",
+        open_completion_then_fail_reader_setup,
+    )
 
     expected_error: type[BaseException] = MemoryError if kind == "memory" else (
         llama_slice.LlamaSliceCancellationError
@@ -17916,6 +18225,146 @@ def test_step10_windows_startup_session_rejects_early_root_exit_and_forces_clean
     assert zero_waits == [(107, 0.0)]
 
 
+def test_step10_windows_startup_failure_zeroizes_diagnostic_tails_retained_by_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = b"SECRET-STARTUP-DIAGNOSTIC-TAIL"
+
+    class _DiagnosticTailApi(_Step10StartupSessionApi):
+        def __init__(self) -> None:
+            super().__init__(port=None, root_exits=True)
+            self.secret_emitted = threading.Event()
+
+        def read_file(self, *, handle: int, maximum_bytes: int) -> bytes:
+            stream = "stdout" if handle == 103 else "stderr"
+            self.events.append(
+                ("read-file", (handle, maximum_bytes, threading.get_ident()))
+            )
+            self.reader_started[stream].set()
+            if handle == 103 and self.stdout_first_read:
+                self.stdout_first_read = False
+                self.secret_emitted.set()
+                return secret + b"\n"
+            if not self.reader_release.wait(2.0):
+                raise AssertionError("startup reader was not released")
+            return b""
+
+    api = _DiagnosticTailApi()
+    original_factory = llama_slice.start_llama_windows_log_readers
+
+    def secret_emitting_factory(**kwargs: Any) -> Any:
+        readers = original_factory(**kwargs)
+        assert api.secret_emitted.wait(2.0)
+        return readers
+
+    monkeypatch.setattr(
+        llama_slice,
+        "start_llama_windows_log_readers",
+        secret_emitting_factory,
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+        llama_slice._start_llama_server_windows_session_unverified(
+            api=api,  # type: ignore[arg-type]
+            command=_step7_launch_command(profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID),
+            clock=_Step8Clock([1_000_000_000, 1_100_000_000]),  # type: ignore[arg-type]
+            wait_strategy=_Step10StartupWait(api),  # type: ignore[arg-type]
+        )
+
+    error = raised.value
+    assert error.code == "startup_failed"
+    assert error.__traceback__ is not None
+    traceback_cursor = error.__traceback__
+    retained_readers: tuple[llama_slice.LlamaWindowsPipeLogReaderTask, ...] | None = None
+    while traceback_cursor is not None:
+        if traceback_cursor.tb_frame.f_code.co_name == (
+            "_start_llama_server_windows_session_impl"
+        ):
+            retained_readers = cast(
+                tuple[llama_slice.LlamaWindowsPipeLogReaderTask, ...],
+                traceback_cursor.tb_frame.f_locals["cleanup_readers"],
+            )
+            break
+        traceback_cursor = traceback_cursor.tb_next
+    assert retained_readers is not None
+    retained_outcomes = tuple(reader._outcome for reader in retained_readers)
+    assert all(
+        type(outcome) is llama_slice.LlamaLogDrainOutcome
+        for outcome in retained_outcomes
+    )
+    retained_tails = tuple(
+        cast(llama_slice.LlamaLogDrainOutcome, outcome).diagnostic_tail_bytes
+        for outcome in retained_outcomes
+    )
+    assert secret not in b"".join(retained_tails)
+    assert retained_tails == (b"", b"")
+
+
+@pytest.mark.parametrize(
+    ("marker", "expected_code"),
+    (
+        pytest.param(
+            MemoryError("EXPECTED-STARTUP-DIAGNOSTIC-MEMORY"),
+            None,
+            id="memory",
+        ),
+        pytest.param(
+            KeyboardInterrupt("EXPECTED-STARTUP-DIAGNOSTIC-BASE"),
+            None,
+            id="base",
+        ),
+        pytest.param(
+            RuntimeError("SECRET-STARTUP-DIAGNOSTIC-CLEAR"),
+            "cleanup_failed",
+            id="exception",
+        ),
+    ),
+)
+def test_step10_windows_startup_zeroizer_error_follows_shutdown_error_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    marker: BaseException,
+    expected_code: str | None,
+) -> None:
+    def failing_clear(_outcome: llama_slice.LlamaLogDrainOutcome) -> NoReturn:
+        raise marker
+
+    monkeypatch.setattr(
+        llama_slice.LlamaLogDrainOutcome,
+        "clear_diagnostics",
+        failing_clear,
+    )
+    api = _Step10StartupSessionApi(port=None, root_exits=True)
+
+    if expected_code is None:
+        with pytest.raises(type(marker)) as raised:
+            llama_slice._start_llama_server_windows_session_unverified(
+                api=api,  # type: ignore[arg-type]
+                command=_step7_launch_command(
+                    profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID
+                ),
+                clock=_Step8Clock(  # type: ignore[arg-type]
+                    [1_000_000_000, 1_100_000_000]
+                ),
+                wait_strategy=_Step10StartupWait(api),  # type: ignore[arg-type]
+            )
+        assert raised.value is marker
+    else:
+        with pytest.raises(llama_slice.LlamaSliceLifecycleError) as raised:
+            llama_slice._start_llama_server_windows_session_unverified(
+                api=api,  # type: ignore[arg-type]
+                command=_step7_launch_command(
+                    profile_id=llama_slice.CPU_RUNTIME_PROFILE_ID
+                ),
+                clock=_Step8Clock(  # type: ignore[arg-type]
+                    [1_000_000_000, 1_100_000_000]
+                ),
+                wait_strategy=_Step10StartupWait(api),  # type: ignore[arg-type]
+            )
+        assert raised.value.code == expected_code
+        assert raised.value.__context__ is None
+        assert "SECRET-" not in str(raised.value)
+
+
 @pytest.mark.parametrize("reader_failure", ["eof", "read-error"])
 def test_step10_windows_startup_session_rejects_terminal_reader_before_port(
     reader_failure: str,
@@ -18977,6 +19426,152 @@ def _step11_rehash_report(payload: dict[str, object]) -> dict[str, object]:
     unsigned = dict(payload)
     unsigned.pop("report_sha256", None)
     return {**unsigned, "report_sha256": llama_slice.canonical_sha256(unsigned)}
+
+
+@pytest.mark.parametrize(
+    (
+        "mutation",
+        "field_path",
+        "expected_original",
+        "replacement",
+        "expected_cross_field_error",
+    ),
+    (
+        pytest.param(
+            "artifact_kind",
+            ("artifact_kind",),
+            "hardware_binding_source",
+            "model_comparison",
+            "report lifecycle fields are inconsistent with model_role",
+            id="artifact-kind",
+        ),
+        pytest.param(
+            "measurement_status",
+            ("measurement_status",),
+            "binding_source",
+            "comparison",
+            "report lifecycle fields are inconsistent with model_role",
+            id="measurement-status",
+        ),
+        pytest.param(
+            "binding_source_eligible",
+            ("binding_source_eligible",),
+            True,
+            False,
+            "report lifecycle fields are inconsistent with model_role",
+            id="binding-source-eligible",
+        ),
+        pytest.param(
+            "memory_gate_status",
+            ("memory_gate_status",),
+            "not_evaluated_prebind",
+            "metric_only_comparison",
+            "report lifecycle fields are inconsistent with model_role",
+            id="memory-gate-status",
+        ),
+        pytest.param(
+            "first_token_gate_status",
+            ("first_token_gate_status",),
+            "not_evaluated_prebind",
+            "metric_only_comparison",
+            "report lifecycle fields are inconsistent with model_role",
+            id="first-token-gate-status",
+        ),
+        pytest.param(
+            "first_cpu_sample",
+            ("cpu_first_token_ms_samples", 0),
+            1.0,
+            1.5,
+            "report run evidence is inconsistent",
+            id="first-cpu-sample",
+        ),
+        pytest.param(
+            "cpu_p95",
+            ("cpu_first_token_p95_ms",),
+            19.0,
+            19.5,
+            "report run evidence is inconsistent",
+            id="cpu-p95",
+        ),
+        pytest.param(
+            "report_gpu_offload",
+            ("gpu_offload", "offloaded_layers"),
+            29,
+            28,
+            "report run evidence is inconsistent",
+            id="report-gpu-offload",
+        ),
+        pytest.param(
+            "evidence_report_digest",
+            ("evidence_report_sha256",),
+            "77f60ae85f5d7f983ec22d839663ecd917152d7c61d0c14ddc0386142617a6cd",
+            "0" * 64,
+            "report cited evidence does not match the frozen fixture",
+            id="evidence-report-digest",
+        ),
+        pytest.param(
+            "cited_answer",
+            ("cited_answer", "answer"),
+            "The anchor sentence reports an accuracy of 91.2 percent.",
+            "The cited answer was tampered.",
+            "report cited evidence does not match the frozen fixture",
+            id="cited-answer",
+        ),
+        pytest.param(
+            "sampling_profile_digest",
+            ("sampling_profile_sha256",),
+            "e310ccf52b5113e41e9d8af7dabd135904675a3b04c1e4362e60049c373eddd7",
+            "0" * 64,
+            "report profile hash is inconsistent",
+            id="sampling-profile-digest",
+        ),
+        pytest.param(
+            "selected_runtime_manifest_digest",
+            ("selected_runtime_manifest_sha256",),
+            "ade9654d5cc00040bdd127323d36fb36ce0b6ca337a1eee348b0db99bd653f6b",
+            "0" * 64,
+            "report artifact identities are inconsistent",
+            id="selected-runtime-manifest-digest",
+        ),
+    ),
+)
+def test_step11_report_loader_rejects_each_isolated_cross_field_mutation(
+    tmp_path: Path,
+    mutation: str,
+    field_path: tuple[str | int, ...],
+    expected_original: object,
+    replacement: object,
+    expected_cross_field_error: str,
+) -> None:
+    payload = _step11_report().model_dump(mode="json")
+    cursor: object = payload
+    for component in field_path[:-1]:
+        if isinstance(component, int):
+            assert isinstance(cursor, list)
+            cursor = cursor[component]
+        else:
+            assert isinstance(cursor, dict)
+            cursor = cursor[component]
+    final_component = field_path[-1]
+    if isinstance(final_component, int):
+        assert isinstance(cursor, list)
+        assert cursor[final_component] == expected_original
+        cursor[final_component] = replacement
+    else:
+        assert isinstance(cursor, dict)
+        assert cursor[final_component] == expected_original
+        cursor[final_component] = replacement
+
+    path = tmp_path / f"{mutation}.json"
+    path.write_bytes(_canonical_file_bytes(_step11_rehash_report(payload)))
+
+    with pytest.raises(llama_slice.LlamaSliceReportError, match="not valid") as raised:
+        llama_slice.load_llama_slice_report(
+            path,
+            **_step11_report_manifest_kwargs(),
+        )
+    assert isinstance(raised.value.__cause__, ValidationError)
+    assert expected_cross_field_error in str(raised.value.__cause__)
 
 
 def test_step11_report_writer_publishes_exact_canonical_bytes_and_reloads(
