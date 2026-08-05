@@ -35,6 +35,8 @@ class _ProcessLike(Protocol):
 
     def is_running(self) -> bool: ...
 
+    def wait(self, timeout: float | None = None) -> int | None: ...
+
     def memory_full_info(self) -> _FullMemoryInfo: ...
 
     def memory_info(self) -> _MemoryInfo: ...
@@ -306,10 +308,31 @@ class ProcessTreePeakSampler:
             recheck = child.is_running()
         except (psutil.NoSuchProcess, ProcessLookupError):
             self._record_churn()
+            return
+        except Exception:
+            self._record_access_error()
+            return
+
+        if recheck is False:
+            self._record_churn()
+            return
+        if recheck is not True:
+            self._record_access_error()
+            return
+        if self._platform_system() != "Windows":
+            self._record_access_error()
+            return
+
+        try:
+            wait_result = child.wait(timeout=0.0)
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            self._record_churn()
         except Exception:
             self._record_access_error()
         else:
-            if recheck is False:
+            if wait_result is None or (
+                isinstance(wait_result, int) and not isinstance(wait_result, bool)
+            ):
                 self._record_churn()
             else:
                 self._record_access_error()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from threading import Event, Thread
 from types import SimpleNamespace
+from typing import cast
 
 import psutil
 import pytest
@@ -15,11 +16,19 @@ from academic_chatbot.feasibility.process_tree import (
 )
 
 
+class _WaitNotConfigured(BaseException):
+    pass
+
+
+_WAIT_NOT_CONFIGURED = object()
+
+
 @dataclass(frozen=True)
 class _ProcessState:
     uss: int | BaseException
     rss: int | BaseException
-    running: bool | BaseException | tuple[bool | BaseException, ...] = True
+    running: object = True
+    wait_result: object = _WAIT_NOT_CONFIGURED
 
 
 @dataclass(frozen=True)
@@ -35,6 +44,7 @@ class _Snapshots:
     index: int = 0
     uss_calls: list[int] = field(default_factory=list)
     rss_calls: list[int] = field(default_factory=list)
+    wait_calls: list[tuple[int, float | None]] = field(default_factory=list)
 
     @property
     def current(self) -> _Snapshot:
@@ -68,7 +78,16 @@ class _FakeProcess:
             self._running_call_count += 1
         if isinstance(value, BaseException):
             raise value
-        return value
+        return cast(bool, value)
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        self._snapshots.wait_calls.append((self.pid, timeout))
+        value = self._state().wait_result
+        if value is _WAIT_NOT_CONFIGURED:
+            raise _WaitNotConfigured("wait outcome was not configured")
+        if isinstance(value, BaseException):
+            raise value
+        return cast(int | None, value)
 
     def memory_full_info(self) -> SimpleNamespace:
         self._snapshots.uss_calls.append(self.pid)
@@ -472,14 +491,16 @@ def test_zombie_child_counts_as_churn_without_invalidating_measurement() -> None
     assert result.measurement_valid is True
 
 
+@pytest.mark.parametrize("memory_error", [psutil.AccessDenied(2), PermissionError()])
 @pytest.mark.parametrize(
-    "memory_error",
-    [psutil.AccessDenied(2), PermissionError()],
+    "wait_result",
+    [0, -1, None, psutil.NoSuchProcess(2), ProcessLookupError()],
 )
-def test_child_memory_access_error_with_live_recheck_invalidates_measurement(
+def test_windows_wait_confirmed_child_exit_counts_as_churn(
     memory_error: BaseException,
+    wait_result: object,
 ) -> None:
-    result, _, _ = _run_three_samples(
+    result, snapshots, _ = _run_three_samples(
         (
             _Snapshot({1: _state(100)}),
             _Snapshot(
@@ -489,6 +510,7 @@ def test_child_memory_access_error_with_live_recheck_invalidates_measurement(
                         uss=memory_error,
                         rss=20,
                         running=(True, True),
+                        wait_result=wait_result,
                     ),
                 },
                 descendants=(2,),
@@ -498,9 +520,184 @@ def test_child_memory_access_error_with_live_recheck_invalidates_measurement(
     )
 
     assert result.peak_bytes == 120
+    assert result.process_churn_count == 1
+    assert result.access_error_count == 0
+    assert result.measurement_valid is True
+    assert snapshots.wait_calls == [(2, 0.0)]
+
+
+@pytest.mark.parametrize(
+    "wait_result",
+    [
+        psutil.TimeoutExpired(0.0, pid=2),
+        psutil.AccessDenied(2),
+        PermissionError(),
+        RuntimeError(),
+    ],
+)
+def test_windows_wait_unconfirmed_child_exit_invalidates_measurement(
+    wait_result: BaseException,
+) -> None:
+    result, snapshots, _ = _run_three_samples(
+        (
+            _Snapshot({1: _state(100)}),
+            _Snapshot(
+                {
+                    1: _state(120),
+                    2: _ProcessState(
+                        uss=psutil.AccessDenied(2),
+                        rss=20,
+                        running=(True, True),
+                        wait_result=wait_result,
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _state(90)}),
+        )
+    )
+
     assert result.process_churn_count == 0
     assert result.access_error_count == 1
     assert result.measurement_valid is False
+    assert snapshots.wait_calls == [(2, 0.0)]
+
+
+@pytest.mark.parametrize("wait_result", [True, False, 1.0, "0", object()])
+def test_windows_wait_rejects_contract_invalid_result(wait_result: object) -> None:
+    result, snapshots, _ = _run_three_samples(
+        (
+            _Snapshot({1: _state(100)}),
+            _Snapshot(
+                {
+                    1: _state(120),
+                    2: _ProcessState(
+                        uss=PermissionError(),
+                        rss=20,
+                        running=(True, True),
+                        wait_result=wait_result,
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _state(90)}),
+        )
+    )
+
+    assert result.process_churn_count == 0
+    assert result.access_error_count == 1
+    assert result.measurement_valid is False
+    assert snapshots.wait_calls == [(2, 0.0)]
+
+
+@pytest.mark.parametrize("hard_error", [KeyboardInterrupt(), SystemExit()])
+def test_windows_wait_baseexception_propagates(hard_error: BaseException) -> None:
+    snapshots = _Snapshots(
+        (
+            _Snapshot(
+                {
+                    2: _ProcessState(
+                        uss=PermissionError(),
+                        rss=20,
+                        running=True,
+                        wait_result=hard_error,
+                    )
+                }
+            ),
+        )
+    )
+    sampler = ProcessTreePeakSampler(10, platform_system=lambda: "Windows")
+
+    with pytest.raises(type(hard_error)) as raised:
+        sampler._record_child_memory_access_error(snapshots.process(2))
+
+    assert raised.value is hard_error
+    assert snapshots.wait_calls == [(2, 0.0)]
+
+
+def test_windows_rss_fallback_uses_wait_confirmation() -> None:
+    unavailable = AttributeError("uss is unavailable")
+    result, snapshots, _ = _run_three_samples(
+        (
+            _Snapshot({1: _ProcessState(uss=unavailable, rss=100)}),
+            _Snapshot(
+                {
+                    1: _ProcessState(uss=999, rss=120),
+                    2: _ProcessState(
+                        uss=999,
+                        rss=psutil.AccessDenied(2),
+                        running=(True, True),
+                        wait_result=0,
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _ProcessState(uss=999, rss=90)}),
+        )
+    )
+
+    assert result.metric == "process_tree_sum_rss_bytes"
+    assert result.process_churn_count == 1
+    assert result.access_error_count == 0
+    assert result.measurement_valid is True
+    assert snapshots.wait_calls == [(2, 0.0)]
+
+
+def test_non_windows_live_recheck_remains_invalid_without_wait() -> None:
+    result, snapshots, _ = _run_three_samples(
+        (
+            _Snapshot({1: _ProcessState(uss=999, rss=100)}),
+            _Snapshot(
+                {
+                    1: _ProcessState(uss=999, rss=120),
+                    2: _ProcessState(
+                        uss=999,
+                        rss=psutil.AccessDenied(2),
+                        running=(True, True),
+                        wait_result=0,
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _ProcessState(uss=999, rss=90)}),
+        ),
+        platform_name="Linux",
+    )
+
+    assert result.metric == "process_tree_sum_rss_bytes"
+    assert result.process_churn_count == 0
+    assert result.access_error_count == 1
+    assert result.measurement_valid is False
+    assert snapshots.wait_calls == []
+
+
+@pytest.mark.parametrize("invalid_recheck", [0, 1, "running", None])
+def test_contract_invalid_child_recheck_invalidates_without_wait(
+    invalid_recheck: object,
+) -> None:
+    result, snapshots, _ = _run_three_samples(
+        (
+            _Snapshot({1: _state(100)}),
+            _Snapshot(
+                {
+                    1: _state(120),
+                    2: _ProcessState(
+                        uss=psutil.AccessDenied(2),
+                        rss=20,
+                        running=(True, invalid_recheck),
+                        wait_result=0,
+                    ),
+                },
+                descendants=(2,),
+            ),
+            _Snapshot({1: _state(90)}),
+        )
+    )
+
+    assert result.process_churn_count == 0
+    assert result.access_error_count == 1
+    assert result.measurement_valid is False
+    assert snapshots.wait_calls == []
 
 
 @pytest.mark.parametrize(
@@ -518,7 +715,7 @@ def test_child_memory_access_error_after_confirmed_exit_counts_as_churn(
     memory_error: BaseException,
     stopped_recheck: bool | BaseException,
 ) -> None:
-    result, _, _ = _run_three_samples(
+    result, snapshots, _ = _run_three_samples(
         (
             _Snapshot({1: _state(100)}),
             _Snapshot(
@@ -540,6 +737,7 @@ def test_child_memory_access_error_after_confirmed_exit_counts_as_churn(
     assert result.process_churn_count == 1
     assert result.access_error_count == 0
     assert result.measurement_valid is True
+    assert snapshots.wait_calls == []
 
 
 @pytest.mark.parametrize(
@@ -557,7 +755,7 @@ def test_child_memory_access_error_with_uncertain_recheck_invalidates_measuremen
     memory_error: BaseException,
     recheck_error: BaseException,
 ) -> None:
-    result, _, _ = _run_three_samples(
+    result, snapshots, _ = _run_three_samples(
         (
             _Snapshot({1: _state(100)}),
             _Snapshot(
@@ -579,6 +777,7 @@ def test_child_memory_access_error_with_uncertain_recheck_invalidates_measuremen
     assert result.process_churn_count == 0
     assert result.access_error_count == 1
     assert result.measurement_valid is False
+    assert snapshots.wait_calls == []
 
 
 @pytest.mark.parametrize(
