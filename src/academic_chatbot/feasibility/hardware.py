@@ -15,7 +15,7 @@ import tempfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Protocol, Self, cast
 
 import psutil  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -42,6 +42,177 @@ _PROCESSOR_FEATURES = (
 _PROCESSOR_FEATURE_ORDER = {
     name: position for position, (_, name) in enumerate(_PROCESSOR_FEATURES)
 }
+
+
+class _NativeFunction(Protocol):
+    argtypes: list[object]
+    restype: object
+
+    def __call__(self, *args: object) -> object: ...
+
+
+class _Guid(ctypes.Structure):
+    _fields_ = (
+        ("data1", ctypes.c_uint32),
+        ("data2", ctypes.c_uint16),
+        ("data3", ctypes.c_uint16),
+        ("data4", ctypes.c_ubyte * 8),
+    )
+
+
+_FOLDERID_PROGRAM_FILES = _Guid(
+    0x905E63B6,
+    0xC1BF,
+    0x494E,
+    (ctypes.c_ubyte * 8)(0xB2, 0x9C, 0x65, 0xB7, 0x32, 0xD3, 0xD2, 0x1A),
+)
+_MAX_WINDOWS_DIRECTORY_CHARACTERS = 32_768
+
+
+def _validated_existing_absolute_directory(candidate: Path) -> Path | None:
+    if not candidate.is_absolute():
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_absolute() or not resolved.is_dir():
+        return None
+    return resolved
+
+
+def _read_windows_directory(
+    get_windows_directory: _NativeFunction,
+) -> Path | None:
+    try:
+        buffer = ctypes.create_unicode_buffer(_MAX_WINDOWS_DIRECTORY_CHARACTERS)
+        get_windows_directory.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+        get_windows_directory.restype = ctypes.c_uint
+        length_value = get_windows_directory(
+            buffer,
+            _MAX_WINDOWS_DIRECTORY_CHARACTERS,
+        )
+        if isinstance(length_value, bool) or not isinstance(length_value, int):
+            return None
+        if (
+            length_value == 0
+            or length_value >= _MAX_WINDOWS_DIRECTORY_CHARACTERS
+            or len(buffer.value) != length_value
+        ):
+            return None
+        return _validated_existing_absolute_directory(Path(buffer.value))
+    except (
+        AttributeError,
+        ctypes.ArgumentError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _read_program_files_directory(
+    get_known_folder: _NativeFunction,
+    free_memory: _NativeFunction,
+) -> Path | None:
+    output = ctypes.c_wchar_p()
+    candidate: Path | None = None
+    cleanup_failed = False
+    try:
+        get_known_folder.argtypes = [
+            ctypes.POINTER(_Guid),
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+        get_known_folder.restype = ctypes.c_long
+        free_memory.argtypes = [ctypes.c_void_p]
+        free_memory.restype = None
+        result_value = get_known_folder(
+            ctypes.byref(_FOLDERID_PROGRAM_FILES),
+            0,
+            None,
+            ctypes.byref(output),
+        )
+        output_value = output.value
+        if (
+            not isinstance(result_value, bool)
+            and isinstance(result_value, int)
+            and result_value == 0
+            and isinstance(output_value, str)
+            and output_value
+        ):
+            candidate = _validated_existing_absolute_directory(Path(output_value))
+    except (
+        AttributeError,
+        ctypes.ArgumentError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        candidate = None
+    finally:
+        if bool(output):
+            try:
+                free_memory(ctypes.cast(output, ctypes.c_void_p))
+            except (
+                AttributeError,
+                ctypes.ArgumentError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ):
+                cleanup_failed = True
+    if cleanup_failed:
+        return None
+    return candidate
+
+
+def _authoritative_windows_directory() -> Path | None:
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_windows_directory = cast(
+            _NativeFunction,
+            kernel32.GetWindowsDirectoryW,
+        )
+    except (
+        AttributeError,
+        ctypes.ArgumentError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    return _read_windows_directory(get_windows_directory)
+
+
+def _authoritative_program_files_directory() -> Path | None:
+    if os.name != "nt":
+        return None
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+        get_known_folder = cast(
+            _NativeFunction,
+            shell32.SHGetKnownFolderPath,
+        )
+        free_memory = cast(_NativeFunction, ole32.CoTaskMemFree)
+    except (
+        AttributeError,
+        ctypes.ArgumentError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    return _read_program_files_directory(get_known_folder, free_memory)
 
 
 class _StrictFrozenModel(BaseModel):
@@ -367,12 +538,12 @@ def _trusted_existing_executable(
 
 
 def _windows_system_executable(*relative_parts: str) -> str | None:
-    system_root_value = os.environ.get("SystemRoot")
-    if system_root_value is None:
+    system_root = _authoritative_windows_directory()
+    if system_root is None:
         return None
-    system_root = Path(system_root_value)
     return _trusted_existing_executable(
-        system_root.joinpath(*relative_parts), trusted_root=system_root
+        system_root.joinpath(*relative_parts),
+        trusted_root=system_root,
     )
 
 
@@ -470,10 +641,9 @@ def _nvidia_smi_executable() -> str | None:
     system_executable = _windows_system_executable("System32", "nvidia-smi.exe")
     if system_executable is not None:
         return system_executable
-    program_files_value = os.environ.get("ProgramFiles")
-    if program_files_value is None:
+    program_files = _authoritative_program_files_directory()
+    if program_files is None:
         return None
-    program_files = Path(program_files_value)
     return _trusted_existing_executable(
         program_files / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe",
         trusted_root=program_files,

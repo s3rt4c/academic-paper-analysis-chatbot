@@ -1,5 +1,8 @@
+import ctypes
 import json
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +15,205 @@ from academic_chatbot.feasibility.hardware import (
     build_record,
     main,
 )
+
+
+class _FakeNativeFunction:
+    def __init__(self, callback: Callable[..., object]) -> None:
+        self._callback = callback
+        self.argtypes: list[object] = []
+        self.restype: object = None
+
+    def __call__(self, *args: object) -> object:
+        return self._callback(*args)
+
+
+def test_system_executable_ignores_spoofed_systemroot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_root = tmp_path / "fake-windows"
+    trusted_root = tmp_path / "trusted-windows"
+    fake_executable = fake_root / "System32" / "powercfg.exe"
+    trusted_executable = trusted_root / "System32" / "powercfg.exe"
+    fake_executable.parent.mkdir(parents=True)
+    trusted_executable.parent.mkdir(parents=True)
+    fake_executable.write_bytes(b"fake")
+    trusted_executable.write_bytes(b"trusted")
+    monkeypatch.setenv("SystemRoot", str(fake_root))
+    monkeypatch.setenv("WINDIR", str(fake_root))
+    monkeypatch.setattr(
+        hardware,
+        "_authoritative_windows_directory",
+        lambda: trusted_root.resolve(),
+        raising=False,
+    )
+
+    selected = hardware._windows_system_executable("System32", "powercfg.exe")
+
+    assert selected == str(trusted_executable.resolve())
+
+
+def test_nvidia_executable_ignores_spoofed_programfiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    windows_root = tmp_path / "trusted-windows"
+    program_files = tmp_path / "trusted-program-files"
+    fake_program_files = tmp_path / "fake-program-files"
+    windows_root.mkdir()
+    trusted = program_files / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
+    fake = fake_program_files / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
+    trusted.parent.mkdir(parents=True)
+    fake.parent.mkdir(parents=True)
+    trusted.write_bytes(b"trusted")
+    fake.write_bytes(b"fake")
+    monkeypatch.setenv("SystemRoot", str(windows_root))
+    monkeypatch.setenv("WINDIR", str(windows_root))
+    monkeypatch.setenv("ProgramFiles", str(fake_program_files))
+    monkeypatch.setattr(
+        hardware,
+        "_authoritative_windows_directory",
+        lambda: windows_root.resolve(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hardware,
+        "_authoritative_program_files_directory",
+        lambda: program_files.resolve(),
+        raising=False,
+    )
+
+    assert hardware._nvidia_smi_executable() == str(trusted.resolve())
+
+
+def test_probe_paths_fail_closed_when_authoritative_roots_are_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_root = tmp_path / "fake"
+    fake = fake_root / "System32" / "powercfg.exe"
+    fake.parent.mkdir(parents=True)
+    fake.write_bytes(b"fake")
+    monkeypatch.setenv("SystemRoot", str(fake_root))
+    monkeypatch.setenv("ProgramFiles", str(fake_root))
+    monkeypatch.setattr(
+        hardware,
+        "_authoritative_windows_directory",
+        lambda: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hardware,
+        "_authoritative_program_files_directory",
+        lambda: None,
+        raising=False,
+    )
+
+    assert hardware._windows_system_executable("System32", "powercfg.exe") is None
+    assert hardware._nvidia_smi_executable() is None
+
+
+def test_windows_directory_native_api_accepts_existing_absolute_directory(
+    tmp_path: Path,
+) -> None:
+    trusted_root = tmp_path / "windows"
+    trusted_root.mkdir()
+    native_value = str(trusted_root.resolve())
+
+    def callback(buffer: object, capacity: object) -> int:
+        assert capacity == hardware._MAX_WINDOWS_DIRECTORY_CHARACTERS
+        cast(Any, buffer).value = native_value
+        return len(native_value)
+
+    getter = _FakeNativeFunction(callback)
+
+    assert hardware._read_windows_directory(getter) == trusted_root.resolve()
+    assert getter.argtypes == [ctypes.c_wchar_p, ctypes.c_uint]
+    assert getter.restype is ctypes.c_uint
+
+
+@pytest.mark.parametrize("returned_length", [0, 32_768])
+def test_windows_directory_native_api_rejects_invalid_lengths(
+    returned_length: int,
+) -> None:
+    def callback(_buffer: object, _capacity: object) -> int:
+        return returned_length
+
+    assert hardware._read_windows_directory(_FakeNativeFunction(callback)) is None
+
+
+def test_windows_directory_native_api_rejects_existing_relative_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relative_root = Path("relative-windows")
+    (tmp_path / relative_root).mkdir()
+    monkeypatch.chdir(tmp_path)
+    native_value = str(relative_root)
+
+    def callback(buffer: object, _capacity: object) -> int:
+        cast(Any, buffer).value = native_value
+        return len(native_value)
+
+    assert hardware._read_windows_directory(_FakeNativeFunction(callback)) is None
+
+
+def test_program_files_native_api_accepts_path_and_frees_pointer(
+    tmp_path: Path,
+) -> None:
+    trusted_root = tmp_path / "program-files"
+    trusted_root.mkdir()
+    freed: list[int | None] = []
+
+    def get_known_folder(
+        _folder_id: object,
+        _flags: object,
+        _token: object,
+        output: object,
+    ) -> int:
+        cast(Any, output)._obj.value = str(trusted_root.resolve())
+        return 0
+
+    def free_memory(pointer: object) -> None:
+        freed.append(cast(Any, pointer).value)
+
+    getter = _FakeNativeFunction(get_known_folder)
+    freer = _FakeNativeFunction(free_memory)
+
+    assert (
+        hardware._read_program_files_directory(getter, freer)
+        == trusted_root.resolve()
+    )
+    assert len(freed) == 1
+    assert freed[0] is not None
+    assert freer.argtypes == [ctypes.c_void_p]
+    assert freer.restype is None
+
+
+def test_program_files_native_api_failure_still_frees_allocated_pointer(
+    tmp_path: Path,
+) -> None:
+    allocated_root = tmp_path / "allocated-but-failed"
+    allocated_root.mkdir()
+    freed: list[int | None] = []
+
+    def get_known_folder(
+        _folder_id: object,
+        _flags: object,
+        _token: object,
+        output: object,
+    ) -> int:
+        cast(Any, output)._obj.value = str(allocated_root.resolve())
+        return -1
+
+    def free_memory(pointer: object) -> None:
+        freed.append(cast(Any, pointer).value)
+
+    result = hardware._read_program_files_directory(
+        _FakeNativeFunction(get_known_folder),
+        _FakeNativeFunction(free_memory),
+    )
+
+    assert result is None
+    assert len(freed) == 1
+    assert freed[0] is not None
 
 
 def _sample_facts() -> HardwareFacts:
