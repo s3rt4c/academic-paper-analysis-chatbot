@@ -130,6 +130,7 @@ class ProcessTreePeakSampler:
         self._started = False
         self._finished = False
         self._result: ProcessTreePeak | None = None
+        self._worker_error: BaseException | None = None
 
     @property
     def result(self) -> ProcessTreePeak:
@@ -171,7 +172,20 @@ class ProcessTreePeakSampler:
         if thread is not None:
             thread.join()
 
-        self._record_sample()
+        with self._lock:
+            worker_error = self._worker_error
+        if worker_error is not None:
+            with self._lock:
+                self._finished = True
+            raise worker_error
+
+        try:
+            self._record_sample()
+        except BaseException:
+            with self._lock:
+                self._finished = True
+            raise
+
         measurement_error: RuntimeError | None = None
         with self._lock:
             if self._peak_bytes <= 0:
@@ -214,6 +228,15 @@ class ProcessTreePeakSampler:
         return "process_tree_sum_uss_bytes"
 
     def _sampling_loop(self) -> None:
+        try:
+            self._run_sampling_loop()
+        except BaseException as error:
+            with self._lock:
+                if self._worker_error is None:
+                    self._worker_error = error
+            self._stop_event.set()
+
+    def _run_sampling_loop(self) -> None:
         next_sample_at = self._clock() + self._sample_interval_seconds
         while not self._stop_event.is_set():
             remaining = max(0.0, next_sample_at - self._clock())

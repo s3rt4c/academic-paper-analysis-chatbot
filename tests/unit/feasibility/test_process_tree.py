@@ -924,3 +924,74 @@ def test_memory_gate_rejects_non_integer_limit_bytes(value: object) -> None:
 def test_memory_gate_rejects_non_positive_limit_bytes(value: int) -> None:
     with pytest.raises(ValueError, match="limit_bytes must be positive"):
         evaluate_memory_gate(1, limit_bytes=value)
+
+
+def test_periodic_worker_baseexception_is_reraised_without_result() -> None:
+    hard_error = SystemExit("wait boom")
+    snapshots = _Snapshots(
+        (
+            _Snapshot({1: _state(100)}),
+            _Snapshot(
+                {
+                    1: _state(120),
+                    2: _ProcessState(
+                        uss=PermissionError(),
+                        rss=20,
+                        running=(True, True),
+                        wait_result=hard_error,
+                    ),
+                },
+                descendants=(2,),
+            ),
+        )
+    )
+    clock = _FakeClock()
+    wait = _OneIntervalWait(snapshots, clock)
+    sampler = ProcessTreePeakSampler(
+        10,
+        root_pid=1,
+        process_factory=snapshots.process,
+        platform_system=lambda: "Windows",
+        clock=clock,
+        wait=wait,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        with sampler:
+            assert wait.first_wait_started.wait(timeout=1)
+            wait.allow_interval()
+            worker = sampler._thread
+            assert worker is not None
+            worker.join(timeout=1)
+            assert worker.is_alive() is False
+
+    assert raised.value is hard_error
+    assert snapshots.wait_calls == [(2, 0.0)]
+    with pytest.raises(RuntimeError, match="available only after"):
+        _ = sampler.result
+
+
+def test_periodic_worker_clock_error_is_reraised_without_result() -> None:
+    hard_error = RuntimeError("clock boom")
+    clock_called = Event()
+
+    def fail_clock() -> float:
+        clock_called.set()
+        raise hard_error
+
+    snapshots = _Snapshots((_Snapshot({1: _state(100)}),))
+    sampler = ProcessTreePeakSampler(
+        10,
+        root_pid=1,
+        process_factory=snapshots.process,
+        platform_system=lambda: "Windows",
+        clock=fail_clock,
+    )
+
+    with pytest.raises(RuntimeError, match="clock boom") as raised:
+        with sampler:
+            assert clock_called.wait(timeout=1)
+
+    assert raised.value is hard_error
+    with pytest.raises(RuntimeError, match="available only after"):
+        _ = sampler.result
