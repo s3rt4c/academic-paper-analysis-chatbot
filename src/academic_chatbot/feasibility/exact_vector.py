@@ -114,7 +114,7 @@ def _require_exact_validated_model_bytes(
 
 
 class VectorBenchmarkProfile(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     profile_id: Literal["phase0-exact-vector-v1"] = "phase0-exact-vector-v1"
     row_count: int = Field(default=100_000, gt=0)
@@ -159,7 +159,7 @@ def load_vector_profile(path: Path) -> VectorBenchmarkProfile:
     if not isinstance(vector_payload, dict):
         raise ValueError("Vector profile must contain a vector_exact object.")
     try:
-        return VectorBenchmarkProfile.model_validate(vector_payload)
+        return VectorBenchmarkProfile.model_validate(vector_payload, strict=True)
     except ValidationError as error:
         raise ValueError("Vector profile vector_exact object is invalid.") from error
 

@@ -968,6 +968,96 @@ def test_profile_loader_requires_canonical_utf8_json(tmp_path: Path) -> None:
         module.load_vector_profile(path)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("row_count", "8"),
+        ("normalization_atol", "0.00001"),
+        ("process_tree_sample_interval_ms", "1"),
+    ],
+)
+def test_profile_loader_rejects_coercible_canonical_types(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    module = _exact_vector()
+    path = tmp_path / "phase0.json"
+    profile = module.VectorBenchmarkProfile(
+        row_count=8,
+        query_count=4,
+        top_k=4,
+        process_tree_sample_interval_ms=1,
+    ).model_dump(mode="json")
+    profile[field_name] = invalid_value
+    _write_canonical_json(
+        path,
+        {"schema_version": "1.0.0", "vector_exact": profile},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Vector profile vector_exact object is invalid",
+    ):
+        module.load_vector_profile(path)
+
+
+def test_cli_rejects_coercible_canonical_types_before_work_or_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _exact_vector()
+    config = tmp_path / "phase0.json"
+    workspace = tmp_path / "workspace"
+    output = tmp_path / "report.json"
+    profile = module.VectorBenchmarkProfile(
+        row_count=8,
+        query_count=4,
+        top_k=4,
+        process_tree_sample_interval_ms=1,
+    ).model_dump(mode="json")
+    profile["row_count"] = "8"
+    _write_canonical_json(
+        config,
+        {"schema_version": "1.0.0", "vector_exact": profile},
+    )
+    calls: list[str] = []
+
+    def fail_hardware(_path: Path) -> object:
+        calls.append("hardware")
+        raise AssertionError("hardware loading must not start")
+
+    def fail_benchmark(**_kwargs: object) -> object:
+        calls.append("benchmark")
+        raise AssertionError("benchmark allocation must not start")
+
+    monkeypatch.setattr(module, "_load_hardware_facts", fail_hardware)
+    monkeypatch.setattr(module, "run_benchmark", fail_benchmark)
+
+    result = module.main(
+        [
+            "benchmark",
+            "--config",
+            str(config),
+            "--hardware-facts",
+            str(tmp_path / "unused-hardware.json"),
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(output),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "Vector profile vector_exact object is invalid.\n"
+    assert calls == []
+    assert not workspace.exists()
+    assert not output.exists()
+
+
 def test_independent_pcg64_seeds_generate_distinct_normalized_matrices() -> None:
     module = _exact_vector()
 
