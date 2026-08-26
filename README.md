@@ -88,10 +88,10 @@ From the repository root, create a Python 3.12 environment and install the locke
 
 ```powershell
 py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install --upgrade pip pip-tools
-.venv\Scripts\pip-compile.exe --extra dev --generate-hashes --output-file requirements.lock pyproject.toml
+.venv\Scripts\python.exe -m pip install pip-tools==7.5.3
+.venv\Scripts\pip-compile.exe --extra dev --generate-hashes --allow-unsafe --upgrade-package build==1.5.0 --output-file requirements.lock pyproject.toml
 .venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
-.venv\Scripts\python.exe -m pip install --no-deps -e .
+.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation -e .
 ```
 
 Run the non-live baseline checks:
