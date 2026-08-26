@@ -3,6 +3,7 @@
 .qa/
 docs/*_draft.docx
 
+# Python build and test outputs
 .venv/
 __pycache__/
 .pytest_cache/
@@ -11,7 +12,43 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+api-key.txt
+*-api-key.txt
+secrets/
+credentials/
+
+# Local model/runtime data and benchmark workspaces
 *.gguf
+/models/
+/runtime/
+/model-cache/
+/artifacts/runtime/
 benchmarks/raw/
 benchmarks/work/
+
+# Private research data, local state, and generated outputs
 corpora/private/
+/corpora/local/
+/data/
+/vector/
+*.db
+*.sqlite
+*.sqlite-*
+*.faiss
+*.index
+/exports/
+/logs/
+*.log
+*.tmp
+*.temp
+/diagnostics/
+/recovery/
