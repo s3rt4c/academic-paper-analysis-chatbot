@@ -294,6 +294,27 @@ def _pdf_anchor() -> ModuleType:
         pytest.fail("The native-PDF anchor locator is not implemented.")
 
 
+def _frozen_runtime_tool_versions(module: ModuleType) -> dict[str, str]:
+    reference_profile = module.DEFAULT_REFERENCE_PROFILE
+    return {
+        field: getattr(reference_profile, field)
+        for field in module._runtime_tool_versions()
+    }
+
+
+@pytest.fixture(autouse=True)
+def _inject_frozen_reference_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _pdf_anchor()
+    frozen_versions = _frozen_runtime_tool_versions(module)
+    monkeypatch.setattr(
+        module,
+        "_runtime_tool_versions",
+        lambda: dict(frozen_versions),
+    )
+
+
 def _canonical_sha256(payload: object) -> str:
     encoded = json.dumps(
         payload,
@@ -1537,7 +1558,9 @@ def test_render_evidence_rejects_extra_coercing_and_inconsistent_fields() -> Non
         )
 
 
-def test_success_report_is_exact_frozen_self_hashed_and_reference_verified() -> None:
+def test_report_factory_and_validation_require_frozen_runtime_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _pdf_anchor()
 
     report = _create_report(module)
@@ -1591,6 +1614,23 @@ def test_success_report_is_exact_frozen_self_hashed_and_reference_verified() -> 
         module.PdfAnchorReport.model_validate(
             {**report.model_dump(mode="python"), "unexpected": True}
         )
+
+    mismatched_versions = _frozen_runtime_tool_versions(module)
+    mismatched_versions["python_version"] = "0.0.0"
+    monkeypatch.setattr(
+        module,
+        "_runtime_tool_versions",
+        lambda: dict(mismatched_versions),
+    )
+
+    with pytest.raises(
+        module.PdfAnchorOperationalError,
+        match="Installed PDF tool versions do not match the reference profile",
+    ):
+        _create_report(module)
+
+    with pytest.raises(ValidationError, match="installed runtime"):
+        module.PdfAnchorReport.model_validate(report.model_dump(mode="python"))
 
 
 @pytest.mark.parametrize(

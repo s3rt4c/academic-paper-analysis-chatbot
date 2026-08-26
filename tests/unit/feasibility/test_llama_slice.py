@@ -26,7 +26,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from academic_chatbot.feasibility import llama_slice
+from academic_chatbot.feasibility import llama_slice, pdf_anchor
 from academic_chatbot.ports import model as model_port
 from academic_chatbot.ports.model import (
     CancellationSignal,
@@ -37,6 +37,22 @@ from academic_chatbot.ports.model import (
     StructuredGenerationResult,
     StructuredLocalModel,
 )
+
+
+@pytest.fixture(autouse=True)
+def _inject_frozen_pdf_reference_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference_profile = pdf_anchor.DEFAULT_REFERENCE_PROFILE
+    frozen_versions = {
+        field: getattr(reference_profile, field)
+        for field in pdf_anchor._runtime_tool_versions()
+    }
+    monkeypatch.setattr(
+        pdf_anchor,
+        "_runtime_tool_versions",
+        lambda: dict(frozen_versions),
+    )
 
 
 def _write_test_zip(
