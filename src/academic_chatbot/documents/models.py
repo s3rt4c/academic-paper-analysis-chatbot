@@ -154,6 +154,19 @@ class NativePdfDocument(BaseModel):
         return self
 
 
+class PublishedDocumentGeneration(BaseModel):
+    """The durable publication result for one immutable parsed FileVersion."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    file_version_id: str = Field(min_length=1)
+    document_generation_id: str = Field(min_length=1)
+    processing_profile_id: str = Field(min_length=1)
+    page_count: int = Field(ge=0)
+    chunk_count: int = Field(ge=0)
+    reused: bool
+
+
 def _native_text_quality(canonical_text: str, word_count: int) -> Literal[
     "adequate_native_text", "low_native_text", "empty_native_text"
 ]:

@@ -32,12 +32,33 @@ def test_new_database_reaches_document_core_migration_with_integrity_pragmas(
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        versions = connection.execute("SELECT version FROM schema_migrations")
+        versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         assert [tuple(row) for row in versions] == [
             (1,),
             (2,),
+            (3,),
         ]
         assert connection.execute("SELECT count(*) FROM projects").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_chunk_fts5_uses_the_locked_runtime_unicode61_tokenizer(tmp_path: Path) -> None:
+    """Would fail if 0003 assumed an unavailable FTS5 tokenizer extension."""
+    data_root = tmp_path / "data"
+    database_path = data_root / "projects" / "project-1" / "project.sqlite3"
+    _migration_runner().migrate_copy(database_path, data_root=data_root)
+
+    connection = connect_project_database(database_path, data_root=data_root)
+    try:
+        connection.execute(
+            "INSERT INTO chunk_fts (chunk_id, chunk_text) VALUES ('chunk-1', 'café evidence')"
+        )
+        matched = connection.execute(
+            "SELECT chunk_id FROM chunk_fts WHERE chunk_fts MATCH 'cafe'"
+        )
+        assert [tuple(row) for row in matched] == [("chunk-1",)]
+        assert connection.execute("INSERT INTO chunk_fts(chunk_fts) VALUES ('integrity-check')")
     finally:
         connection.close()
 
@@ -113,7 +134,7 @@ def test_failed_migration_preserves_previous_valid_database(tmp_path: Path) -> N
     migration_directory.mkdir()
     for migration in _default_migration_directory().glob("*.sql"):
         shutil.copy2(migration, migration_directory)
-    (migration_directory / "0003_broken.sql").write_text(
+    (migration_directory / "0004_broken.sql").write_text(
         "CREATE TABLE transient_marker (value TEXT NOT NULL) STRICT;\nBROKEN SQL;\n",
         encoding="utf-8",
     )
@@ -125,10 +146,11 @@ def test_failed_migration_preserves_previous_valid_database(tmp_path: Path) -> N
     connection = connect_project_database(database_path, data_root=data_root)
     try:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        versions = connection.execute("SELECT version FROM schema_migrations")
+        versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         assert [tuple(row) for row in versions] == [
             (1,),
             (2,),
+            (3,),
         ]
         transient_marker = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'transient_marker'"
@@ -205,7 +227,7 @@ def test_paper_scoped_file_version_migration_preserves_existing_evidence_lineage
         assert [
             tuple(row)
             for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
-        ] == [(1,), (2,)]
+        ] == [(1,), (2,), (3,)]
         assert tuple(
             connection.execute(
                 "SELECT file_version_id, paper_id, sha256, original_relative_path "
@@ -220,6 +242,11 @@ def test_paper_scoped_file_version_migration_preserves_existing_evidence_lineage
         assert tuple(
             connection.execute("SELECT page_id, document_generation_id FROM pages").fetchone()
         ) == ("page-1", "generation-1")
+        assert tuple(
+            connection.execute(
+                "SELECT text_relative_path, canonical_text FROM pages WHERE page_id = 'page-1'"
+            ).fetchone()
+        ) == ("derivatives/page-1.txt", None)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
