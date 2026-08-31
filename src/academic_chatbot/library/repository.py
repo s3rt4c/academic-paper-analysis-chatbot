@@ -72,29 +72,36 @@ class ProjectRepository:
 
     def register_file_version(self, *, file_version: FileVersion) -> FileVersion:
         with self._connection() as connection, immediate_transaction(connection):
-            row = connection.execute(
+            return self.register_file_version_in_transaction(
+                connection=connection, file_version=file_version
+            )
+
+    def register_file_version_in_transaction(
+        self, *, connection: sqlite3.Connection, file_version: FileVersion
+    ) -> FileVersion:
+        row = connection.execute(
+            """
+            SELECT file_version_id, paper_id, sha256, original_relative_path
+            FROM file_versions WHERE paper_id = ? AND sha256 = ?
+            """,
+            (file_version.paper_id, file_version.sha256),
+        ).fetchone()
+        if row is None:
+            connection.execute(
                 """
-                SELECT file_version_id, paper_id, sha256, original_relative_path
-                FROM file_versions WHERE sha256 = ?
+                INSERT INTO file_versions
+                    (file_version_id, paper_id, sha256, original_relative_path, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (file_version.sha256,),
-            ).fetchone()
-            if row is None:
-                connection.execute(
-                    """
-                    INSERT INTO file_versions
-                        (file_version_id, paper_id, sha256, original_relative_path, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        file_version.file_version_id,
-                        file_version.paper_id,
-                        file_version.sha256,
-                        file_version.stored_relative_path,
-                        _timestamp(),
-                    ),
-                )
-                return file_version
+                (
+                    file_version.file_version_id,
+                    file_version.paper_id,
+                    file_version.sha256,
+                    file_version.stored_relative_path,
+                    _timestamp(),
+                ),
+            )
+            return file_version
         return FileVersion(
             file_version_id=str(row[0]),
             paper_id=str(row[1]),
@@ -103,8 +110,19 @@ class ProjectRepository:
             stored_relative_path=str(row[3]),
         )
 
-    def file_version_exists(self, sha256: str) -> bool:
+    def any_file_version_references_sha256(
+        self, sha256: str, *, connection: sqlite3.Connection | None = None
+    ) -> bool:
+        if connection is not None:
+            return connection.execute(
+                "SELECT 1 FROM file_versions WHERE sha256 = ?", (sha256,)
+            ).fetchone() is not None
         return self._one("SELECT 1 FROM file_versions WHERE sha256 = ?", (sha256,)) is not None
+
+    @contextmanager
+    def file_version_admission_transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._connection() as connection, immediate_transaction(connection):
+            yield connection
 
     def file_version_count(self) -> int:
         row = self._one("SELECT count(*) FROM file_versions", ())

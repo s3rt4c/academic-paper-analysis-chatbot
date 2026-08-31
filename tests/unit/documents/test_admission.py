@@ -117,19 +117,60 @@ def test_identical_bytes_reuse_one_immutable_file_version(tmp_path: Path) -> Non
     ]
 
 
-def test_identical_bytes_for_another_paper_reuse_the_schema_owned_version(tmp_path: Path) -> None:
+def test_identical_bytes_for_another_paper_preserve_each_paper_ownership(tmp_path: Path) -> None:
     service, project_id, paper_id = _service_with_paper(tmp_path)
     other_paper = service.create_paper(project_id=project_id, paper_id="paper-2")
     source = tmp_path / "same.pdf"
     source.write_bytes(_PDF_BYTES)
 
     first = service.admit_pdf(project_id=project_id, paper_id=paper_id, source_path=source)
-    reused = service.admit_pdf(
+    second = service.admit_pdf(
+        project_id=project_id, paper_id=other_paper.paper_id, source_path=source
+    )
+    first_reimported = service.admit_pdf(
+        project_id=project_id, paper_id=paper_id, source_path=source
+    )
+    second_reimported = service.admit_pdf(
         project_id=project_id, paper_id=other_paper.paper_id, source_path=source
     )
 
-    assert reused.file_version_id == first.file_version_id
-    assert reused.paper_id == paper_id
+    assert first.paper_id == paper_id
+    assert second.paper_id == other_paper.paper_id
+    assert first.file_version_id != second.file_version_id
+    assert first.sha256 == second.sha256
+    assert first.stored_relative_path == second.stored_relative_path
+    assert first_reimported == first
+    assert second_reimported == second
+    repository = service.repository_for_project_id(project_id)
+    assert repository.file_version_count() == 2
+    paths = ProjectPaths.create(tmp_path / "data", project_id=project_id)
+    assert list(paths.originals_dir.rglob("*.pdf")) == [
+        paths.resolve_relative(first.stored_relative_path)
+    ]
+
+
+def test_shared_original_survives_failed_second_paper_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, project_id, paper_id = _service_with_paper(tmp_path)
+    other_paper = service.create_paper(project_id=project_id, paper_id="paper-2")
+    source = tmp_path / "same.pdf"
+    source.write_bytes(_PDF_BYTES)
+    first = service.admit_pdf(project_id=project_id, paper_id=paper_id, source_path=source)
+    paths = ProjectPaths.create(tmp_path / "data", project_id=project_id)
+    stored = paths.resolve_relative(first.stored_relative_path)
+
+    def fail_registration(self: ProjectRepository, **kwargs: object) -> object:
+        raise RuntimeError("synthetic second-paper database failure")
+
+    monkeypatch.setattr(
+        ProjectRepository, "register_file_version_in_transaction", fail_registration
+    )
+
+    with pytest.raises(RuntimeError, match="second-paper database failure"):
+        service.admit_pdf(project_id=project_id, paper_id=other_paper.paper_id, source_path=source)
+
+    assert stored.read_bytes() == _PDF_BYTES
     assert service.repository_for_project_id(project_id).file_version_count() == 1
 
 
@@ -203,7 +244,9 @@ def test_database_failure_removes_a_new_unregistered_original(
     def fail_registration(self: ProjectRepository, **kwargs: object) -> object:
         raise RuntimeError("synthetic database failure")
 
-    monkeypatch.setattr(ProjectRepository, "register_file_version", fail_registration)
+    monkeypatch.setattr(
+        ProjectRepository, "register_file_version_in_transaction", fail_registration
+    )
 
     with pytest.raises(RuntimeError, match="synthetic database failure"):
         service.admit_pdf(project_id=project_id, paper_id=paper_id, source_path=source)

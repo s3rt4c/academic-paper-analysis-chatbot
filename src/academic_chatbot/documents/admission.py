@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 import stat
 import uuid
 from pathlib import Path
 
-from academic_chatbot.domain.library import FileVersion
+from academic_chatbot.domain.library import FileVersion, file_version_id_for
 from academic_chatbot.library.repository import ProjectRepository
 from academic_chatbot.storage.atomic import StreamCopyLimitError, atomic_stream_copy
 from academic_chatbot.storage.paths import ProjectPaths
@@ -92,48 +93,55 @@ class PdfAdmissionService:
             if not _same_source_state(before, after):
                 raise PdfIntegrityError("source changed while it was being admitted")
 
-            stored_relative_path = f"originals/sha256/{copied.sha256}.pdf"
-            target = self._paths.resolve_relative(stored_relative_path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                if (
-                    target.is_symlink()
-                    or _file_digest(target, chunk_size=self._chunk_size) != copied.sha256
-                ):
-                    message = "existing content-addressed original does not match its digest"
-                    raise PdfIntegrityError(message)
-            else:
-                with staging.open("rb") as staged_handle:
-                    published = atomic_stream_copy(
-                        staged_handle,
-                        target,
-                        max_bytes=self._max_pdf_bytes,
-                        chunk_size=self._chunk_size,
-                    )
-                if (
-                    published != copied
-                    or _file_digest(target, chunk_size=self._chunk_size) != copied.sha256
-                ):
-                    target.unlink(missing_ok=True)
-                    message = "published original does not match the streamed source digest"
-                    raise PdfIntegrityError(message)
-                published_target = target
-                published_here = True
+            with self._repository.file_version_admission_transaction() as connection:
+                stored_relative_path = f"originals/sha256/{copied.sha256}.pdf"
+                target = self._paths.resolve_relative(stored_relative_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    if (
+                        target.is_symlink()
+                        or _file_digest(target, chunk_size=self._chunk_size) != copied.sha256
+                    ):
+                        message = "existing content-addressed original does not match its digest"
+                        raise PdfIntegrityError(message)
+                else:
+                    with staging.open("rb") as staged_handle:
+                        published = atomic_stream_copy(
+                            staged_handle,
+                            target,
+                            max_bytes=self._max_pdf_bytes,
+                            chunk_size=self._chunk_size,
+                        )
+                    if (
+                        published != copied
+                        or _file_digest(target, chunk_size=self._chunk_size) != copied.sha256
+                    ):
+                        target.unlink(missing_ok=True)
+                        message = "published original does not match the streamed source digest"
+                        raise PdfIntegrityError(message)
+                    published_target = target
+                    published_here = True
 
-            file_version = FileVersion(
-                file_version_id=f"fv-sha256-{copied.sha256}",
-                paper_id=paper_id,
-                sha256=copied.sha256,
-                byte_length=copied.byte_length,
-                stored_relative_path=stored_relative_path,
-            )
-            try:
-                return self._repository.register_file_version(file_version=file_version)
-            except BaseException:
-                self._cleanup_after_registration_failure(
-                    published_target, published_here, copied.sha256
+                file_version = FileVersion(
+                    file_version_id=file_version_id_for(paper_id=paper_id, sha256=copied.sha256),
+                    paper_id=paper_id,
+                    sha256=copied.sha256,
+                    byte_length=copied.byte_length,
+                    stored_relative_path=stored_relative_path,
                 )
-                raise
+                try:
+                    registered = self._repository.register_file_version_in_transaction(
+                        connection=connection, file_version=file_version
+                    )
+                    if registered.paper_id != paper_id:
+                        message = "registered file version does not belong to requested paper"
+                        raise PdfAdmissionError(message)
+                    return registered
+                except BaseException:
+                    self._cleanup_after_registration_failure(
+                        connection, published_target, published_here, copied.sha256
+                    )
+                    raise
         finally:
             staging.unlink(missing_ok=True)
 
@@ -172,6 +180,7 @@ class PdfAdmissionService:
 
     def _cleanup_after_registration_failure(
         self,
+        connection: sqlite3.Connection,
         published_target: Path | None,
         published_here: bool,
         sha256: str,
@@ -179,7 +188,9 @@ class PdfAdmissionService:
         if not published_here or published_target is None:
             return
         try:
-            if not self._repository.file_version_exists(sha256):
+            if not self._repository.any_file_version_references_sha256(
+                sha256, connection=connection
+            ):
                 published_target.unlink(missing_ok=True)
         except BaseException:
             # If SQLite state cannot be determined, retain a non-authoritative
