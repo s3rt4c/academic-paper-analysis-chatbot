@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,6 +43,40 @@ def connect_project_database(database_path: Path, *, data_root: Path) -> sqlite3
             raise sqlite3.DatabaseError(message)
         connection.execute("PRAGMA synchronous = FULL")
         _verified_pragma(connection, "synchronous", 2)
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def open_read_only_connection(database_path: Path, *, data_root: Path) -> sqlite3.Connection:
+    """Open an existing contained project database without write-capable setup."""
+
+    try:
+        path = ensure_path_beneath(root=data_root, candidate=database_path)
+    except ValueError as error:
+        raise DatabasePathError(str(error)) from error
+    try:
+        metadata = path.stat()
+    except FileNotFoundError as error:
+        raise DatabasePathError("project database does not exist") from error
+    except OSError as error:
+        raise DatabasePathError("project database could not be inspected") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise DatabasePathError("project database must be an existing regular file")
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=5.0
+        )
+    except sqlite3.Error as error:
+        raise DatabasePathError("project database could not be opened read-only") from error
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        _verified_pragma(connection, "foreign_keys", 1)
+        connection.execute("PRAGMA query_only = ON")
+        _verified_pragma(connection, "query_only", 1)
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
     except BaseException:
