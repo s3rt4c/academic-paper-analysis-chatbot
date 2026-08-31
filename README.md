@@ -10,7 +10,9 @@ Researchers need more than document chat: they need answers that can be traced t
 
 **Phase 0 — technical feasibility: complete.** The implemented code, tests, manifests, and pinned reports validate selected local components and lifecycle safeguards on a recorded reference profile.
 
-**Phases 1–4 are planned, not implemented product features.** This repository does not yet provide the full end-user document workspace, hybrid retrieval experience, evidence-chat interface, academic discovery workflow, or release packaging described in the roadmap.
+**Phase 1A — local document core: implemented.** The repository now includes a Windows-first, offline native-PDF path from local project storage through evidence-bearing lexical retrieval.
+
+**Phase 1B–4 remain planned.** This repository does not yet provide the full document workspace, hybrid retrieval experience, evidence-chat interface, academic discovery workflow, or release packaging described in the roadmap.
 
 ## What Phase 0 validates
 
@@ -19,6 +21,17 @@ Researchers need more than document chat: they need answers that can be traced t
 - Immutable native-PDF anchor evidence and deterministic exact-vector retrieval checks.
 - A pinned local `llama.cpp` feasibility slice with model/runtime provenance, process-tree containment, shutdown checks, cancellation recovery, and partial-result quarantine.
 - Public, hash-addressed benchmark reports. Model files, runtimes, private corpora, and generated credentials are deliberately not included.
+
+## What Phase 1A provides
+
+- Windows-first local Project, Paper, and immutable FileVersion persistence.
+- Secure local native-PDF admission into SHA-256 content-addressed originals.
+- Canonical native-text parsing with persisted `NativePdfAnchor` evidence.
+- Immutable document generations, page-bounded `lexical-chunk-v1` chunks, and SQLite FTS5 indexing.
+- Deterministic project-scoped lexical retrieval through a local CLI, returning page, chunk, and range-scoped anchor evidence.
+- Offline acceptance coverage for the normal document path, including no-network and no-external-subprocess guards.
+
+OCR execution, embeddings, vector and hybrid retrieval, reranking, LLM analysis/synthesis, FastAPI, a browser UI, and recovery/workers are not implemented in Phase 1A.
 
 ## Architecture direction
 
@@ -63,7 +76,8 @@ tools/                Documentation and fixture support tools
 ## Roadmap
 
 - **Phase 0 — Technical feasibility:** complete
-- **Phase 1 — Local document core:** planned / next
+- **Phase 1A — Local document core:** complete
+- **Phase 1B — Local document workspace and analysis:** planned
 - **Phase 2 — Deep analysis and Evidence Chat:** planned
 - **Phase 3 — Academic discovery:** planned
 - **Phase 4 — Packaging and hardening:** planned
@@ -81,6 +95,7 @@ tools/                Documentation and fixture support tools
 - The recorded measurements apply only to the documented reference profile and pinned artifacts.
 - Model/runtime downloads are intentionally out of scope for this repository.
 - No public hosted service, user interface, or cloud deployment is provided.
+- Phase 1A does not execute OCR, embeddings, vector/hybrid retrieval, reranking, LLM analysis/synthesis, FastAPI, browser UI, or recovery/workers.
 
 ## Development setup
 
@@ -98,6 +113,10 @@ Run the non-live baseline checks:
 
 ```powershell
 .venv\Scripts\python.exe -m pytest tests/unit -q
+.venv\Scripts\python.exe -m pytest tests/contract -q
+.venv\Scripts\python.exe -m pytest tests/integration -q
+.venv\Scripts\python.exe -m pytest tests/e2e -q
+.venv\Scripts\python.exe -m pytest tests/security -q
 .venv\Scripts\python.exe -m ruff check src tests
 .venv\Scripts\python.exe -m mypy src
 .venv\Scripts\python.exe -m pip check
