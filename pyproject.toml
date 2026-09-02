@@ -20,6 +20,7 @@ dependencies = [
   "pydantic-settings",
   "pypdfium2",
   "python-multipart",
+  "tokenizers==0.20.0",
   "uvicorn",
 ]
 
