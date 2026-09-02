@@ -12,7 +12,14 @@ Researchers need more than document chat: they need answers that can be traced t
 
 **Phase 1A — local document core: implemented.** The repository now includes a Windows-first, offline native-PDF path from local project storage through evidence-bearing lexical retrieval.
 
-**Phase 1B–4 remain planned.** This repository does not yet provide the full document workspace, hybrid retrieval experience, evidence-chat interface, academic discovery workflow, or release packaging described in the roadmap.
+**Phase 1B — native-text semantic retrieval foundation: complete.** It adds a
+private, local-only semantic retrieval path to the Phase 1A document core.
+This is not hybrid retrieval, a full document workspace, an evidence-chat
+interface, or a representative 50–300-paper performance certification.
+
+**Phase 1C–4 remain planned.** This repository does not yet provide hybrid
+retrieval, reranking, OCR execution, LLM analysis, an API/UI, academic
+discovery, background workers, or release packaging.
 
 ## What Phase 0 validates
 
@@ -32,6 +39,26 @@ Researchers need more than document chat: they need answers that can be traced t
 - Offline acceptance coverage for the normal document path, including no-network and no-external-subprocess guards.
 
 OCR execution, embeddings, vector and hybrid retrieval, reranking, LLM analysis/synthesis, FastAPI, a browser UI, and recovery/workers are not implemented in Phase 1A.
+
+## What Phase 1B provides
+
+- A frozen `BAAI/bge-small-en-v1.5` embedding profile at immutable revision
+  `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`.
+- Verified, administrator-provisioned local model artifacts; model assets are
+  neither included in Git nor downloaded by the application at runtime.
+- CPU-only ONNX Runtime embeddings with exact tokenizer budgets, explicit
+  document/query roles, and no silent truncation.
+- Tokenizer-aware semantic spans, immutable project-local vector generations,
+  float16 read-only memory-mapped exact-vector storage, and deterministic
+  cosine ranking.
+- `semantic-index build` and `search --mode semantic`, producing
+  evidence-bearing semantic hits tied to the active document generation.
+- Fail-closed stale-index behavior, explicit rebuilds, valid empty-generation
+  results, and unchanged lexical retrieval.
+
+The accepted reference-class measurements and gate outcomes are recorded in
+[`benchmarks/results/semantic-retrieval-phase1b.json`](benchmarks/results/semantic-retrieval-phase1b.json).
+They are local acceptance evidence, not general support guarantees.
 
 ## Architecture direction
 
@@ -77,7 +104,7 @@ tools/                Documentation and fixture support tools
 
 - **Phase 0 — Technical feasibility:** complete
 - **Phase 1A — Local document core:** complete
-- **Phase 1B — Local document workspace and analysis:** planned
+- **Phase 1B — Native-text semantic retrieval foundation:** complete
 - **Phase 2 — Deep analysis and Evidence Chat:** planned
 - **Phase 3 — Academic discovery:** planned
 - **Phase 4 — Packaging and hardening:** planned
@@ -95,7 +122,13 @@ tools/                Documentation and fixture support tools
 - The recorded measurements apply only to the documented reference profile and pinned artifacts.
 - Model/runtime downloads are intentionally out of scope for this repository.
 - No public hosted service, user interface, or cloud deployment is provided.
-- Phase 1A does not execute OCR, embeddings, vector/hybrid retrieval, reranking, LLM analysis/synthesis, FastAPI, browser UI, or recovery/workers.
+- Phase 1B does not implement hybrid fusion, reranking, OCR execution, LLM
+  analysis/synthesis, citation-verification analysis, FastAPI, a browser UI,
+  background jobs/workers, automatic model acquisition, or ANN/vector
+  databases.
+- Phase 1B's repeated public synthetic span study does not certify diverse
+  50-, 100-, or 300-paper academic-corpus latency, token-length distribution,
+  excluded-unembeddable incidence, or large-corpus query P95.
 
 ## Development setup
 
@@ -123,6 +156,31 @@ Run the non-live baseline checks:
 ```
 
 `tools/rasterize_pdf.py` uses Poppler from `PATH` by default. If needed, set `ACADEMIC_CHATBOT_POPPLER_PATH` to the directory containing the Poppler binaries.
+
+## Phase 1B semantic workflow
+
+The model root is selected explicitly and must already contain the verified
+frozen artifact inventory. It remains outside Git and outside project data.
+
+```powershell
+$profile = "ep-sha256-3f8fd2dbcff088eb61b2ef1ecbc6de57644a425722a586fef32059516146a929"
+$modelRoot = "<approved-local-model-root>"
+$dataRoot = ".\\local-data"
+$maxPdfBytes = 100000000
+
+.venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes project create --project-id research --display-name Research
+.venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes paper create --project-id research --paper-id paper-one
+.venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes import-pdf --project-id research --paper-id paper-one --source <local-pdf-path>
+.venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes semantic-index build --project-id research --embedding-profile-id $profile --model-root $modelRoot
+.venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes search --mode semantic --project-id research --query "accuracy" --embedding-profile-id $profile --model-root $modelRoot
+```
+
+For the opt-in real frozen-model contract, set
+`ACADEMIC_CHATBOT_BGE_ARTIFACT_ROOT` to that approved local root and run:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/contract/test_offline_embedder.py -m real_embedding -q
+```
 
 ## License
 
