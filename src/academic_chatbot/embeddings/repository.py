@@ -65,6 +65,32 @@ class SourceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalSourceWord:
+    """One durable canonical-word anchor used for exact semantic span construction."""
+
+    text: str
+    start_offset: int
+    end_offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveChunkSource:
+    """One active lexical chunk with its page-local canonical word ranges."""
+
+    file_version_id: str
+    document_generation_id: str
+    page_id: str
+    physical_page_index: int
+    chunk_id: str
+    chunk_ordinal: int
+    page_text: str
+    chunk_text: str
+    chunk_start_offset: int
+    chunk_end_offset: int
+    words: tuple[CanonicalSourceWord, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class VectorGenerationCoverage:
     eligible_native_chunks: int
     embeddable_spans: int
@@ -247,6 +273,184 @@ class EmbeddingRepository:
         return SourceSnapshot(
             project_id, embedding_profile_id, _sha256(canonical_json_bytes(payload)), sources
         )
+
+    def active_chunk_sources(
+        self, *, project_id: str, embedding_profile_id: str
+    ) -> tuple[ActiveChunkSource, ...]:
+        """Read active chunks with construction-derived persisted word anchors.
+
+        The query deliberately reads page anchors rather than token offsets or
+        searching canonical text.  A malformed historic generation is rejected
+        before it can produce a semantic span.
+        """
+
+        self._require_repository_project(project_id)
+        validate_embedding_profile_id(embedding_profile_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT fv.file_version_id, active.document_generation_id, p.page_id,
+                    p.physical_page_index, c.chunk_id, c.ordinal, p.canonical_text,
+                    c.chunk_text, c.start_offset AS chunk_start_offset,
+                    c.end_offset AS chunk_end_offset, c.lexical_word_count,
+                    anchor.char_start AS word_start_offset,
+                    anchor.char_end AS word_end_offset, anchor.anchor_text AS word_text
+                FROM file_versions AS fv
+                JOIN papers AS paper ON paper.paper_id = fv.paper_id
+                JOIN generation_publications AS active
+                  ON active.file_version_id = fv.file_version_id
+                JOIN pages AS p ON p.document_generation_id = active.document_generation_id
+                JOIN chunks AS c
+                  ON c.document_generation_id = active.document_generation_id
+                 AND c.page_id = p.page_id
+                LEFT JOIN page_anchors AS anchor
+                  ON anchor.page_id = c.page_id
+                 AND anchor.char_start >= c.start_offset
+                 AND anchor.char_end <= c.end_offset
+                WHERE paper.project_id = ?
+                ORDER BY fv.file_version_id, active.document_generation_id,
+                    p.physical_page_index, c.ordinal, anchor.char_start""",
+                (project_id,),
+            ).fetchall()
+
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["chunk_id"]), []).append(row)
+        sources: list[ActiveChunkSource] = []
+        for chunk_rows in grouped.values():
+            first = chunk_rows[0]
+            words: list[CanonicalSourceWord] = []
+            for row in chunk_rows:
+                if row["word_start_offset"] is None:
+                    continue
+                words.append(
+                    CanonicalSourceWord(
+                        text=str(row["word_text"]),
+                        start_offset=int(row["word_start_offset"]),
+                        end_offset=int(row["word_end_offset"]),
+                    )
+                )
+            source = ActiveChunkSource(
+                file_version_id=str(first["file_version_id"]),
+                document_generation_id=str(first["document_generation_id"]),
+                page_id=str(first["page_id"]),
+                physical_page_index=int(first["physical_page_index"]),
+                chunk_id=str(first["chunk_id"]),
+                chunk_ordinal=int(first["ordinal"]),
+                page_text=str(first["canonical_text"]),
+                chunk_text=str(first["chunk_text"]),
+                chunk_start_offset=int(first["chunk_start_offset"]),
+                chunk_end_offset=int(first["chunk_end_offset"]),
+                words=tuple(words),
+            )
+            _validate_active_chunk_source(
+                source, expected_word_count=int(first["lexical_word_count"])
+            )
+            sources.append(source)
+        return tuple(sources)
+
+    def generation_for_snapshot(
+        self,
+        *,
+        project_id: str,
+        embedding_profile_id: str,
+        source_snapshot_sha256: str,
+    ) -> VectorGeneration | None:
+        """Return the deterministic candidate identity, if it already exists."""
+
+        self._require_repository_project(project_id)
+        validate_embedding_profile_id(embedding_profile_id)
+        _require_sha256(source_snapshot_sha256, "source snapshot hash")
+        generation_id = _generation_id(
+            project_id=project_id,
+            embedding_profile_id=embedding_profile_id,
+            source_snapshot_sha256=source_snapshot_sha256,
+        )
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM vector_generations WHERE vector_generation_id = ?",
+                (generation_id,),
+            ).fetchone()
+        return None if row is None else _generation_from_row(row)
+
+    def candidate_generations(
+        self, *, project_id: str, embedding_profile_id: str
+    ) -> tuple[VectorGeneration, ...]:
+        """Return incomplete candidates for bounded, controlled reconciliation."""
+
+        self._require_repository_project(project_id)
+        validate_embedding_profile_id(embedding_profile_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM vector_generations
+                WHERE project_id = ? AND embedding_profile_id = ? AND state = ?
+                ORDER BY vector_generation_id""",
+                (project_id, embedding_profile_id, VectorGenerationState.DB_CANDIDATE),
+            ).fetchall()
+        return tuple(_generation_from_row(row) for row in rows)
+
+    def finalized_unpublished_generations(
+        self, *, project_id: str, embedding_profile_id: str
+    ) -> tuple[VectorGeneration, ...]:
+        """Return finalized candidates that have no authoritative pointer yet."""
+
+        self._require_repository_project(project_id)
+        validate_embedding_profile_id(embedding_profile_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT generation.* FROM vector_generations AS generation
+                LEFT JOIN vector_generation_publications AS publication
+                  ON publication.vector_generation_id = generation.vector_generation_id
+                WHERE generation.project_id = ? AND generation.embedding_profile_id = ?
+                  AND generation.state = ? AND publication.vector_generation_id IS NULL
+                ORDER BY generation.vector_generation_id""",
+                (project_id, embedding_profile_id, VectorGenerationState.FILES_FINALIZED),
+            ).fetchall()
+        return tuple(_generation_from_row(row) for row in rows)
+
+    def mark_stale(self, vector_generation_id: str) -> None:
+        """Permanently retire an unpublished candidate whose source changed."""
+
+        with self._connection() as connection, immediate_transaction(connection):
+            generation = self._generation_in_transaction(connection, vector_generation_id)
+            if generation.state is not VectorGenerationState.FILES_FINALIZED:
+                raise EmbeddingPersistenceError("only finalized unpublished generations can become stale")
+            published = connection.execute(
+                "SELECT 1 FROM vector_generation_publications WHERE vector_generation_id = ?",
+                (vector_generation_id,),
+            ).fetchone()
+            if published is not None:
+                raise EmbeddingPersistenceError("published vector generations cannot become stale")
+            current = self._snapshot_in_transaction(
+                connection, generation.project_id, generation.embedding_profile_id
+            )
+            if current.source_snapshot_sha256 == generation.source_snapshot_sha256:
+                raise EmbeddingPersistenceError("current vector generation cannot become stale")
+            connection.execute(
+                "UPDATE vector_generations SET state = 'STALE' WHERE vector_generation_id = ?",
+                (vector_generation_id,),
+            )
+
+    def discard_candidate(self, vector_generation_id: str) -> None:
+        """Remove only incomplete DB metadata; finalized files stay forensic orphans."""
+
+        with self._connection() as connection, immediate_transaction(connection):
+            generation = self._generation_in_transaction(connection, vector_generation_id)
+            if generation.state is not VectorGenerationState.DB_CANDIDATE:
+                raise EmbeddingPersistenceError(
+                    "only an incomplete database candidate can be discarded"
+                )
+            connection.execute(
+                "DELETE FROM vector_generation_spans WHERE vector_generation_id = ?",
+                (vector_generation_id,),
+            )
+            connection.execute(
+                "DELETE FROM vector_generation_sources WHERE vector_generation_id = ?",
+                (vector_generation_id,),
+            )
+            connection.execute(
+                "DELETE FROM vector_generations WHERE vector_generation_id = ?",
+                (vector_generation_id,),
+            )
 
     def create_candidate(
         self,
@@ -574,8 +778,7 @@ class EmbeddingRepository:
             or uncovered is not None
             or unmapped_embeddable is not None
             or (
-                int(mapped[0]) > 0
-                and (int(mapped[2]) != 0 or int(mapped[3]) != int(mapped[0]) - 1)
+                int(mapped[0]) > 0 and (int(mapped[2]) != 0 or int(mapped[3]) != int(mapped[0]) - 1)
             )
         ):
             raise EmbeddingPersistenceError(
@@ -621,3 +824,32 @@ def _generation_from_row(row: sqlite3.Row) -> VectorGeneration:
         None if row[6] is None else str(row[6]),
         VectorGenerationCoverage(*(int(row[index]) for index in range(7, 13))),
     )
+
+
+def _validate_active_chunk_source(source: ActiveChunkSource, *, expected_word_count: int) -> None:
+    if (
+        not source.words
+        or source.chunk_start_offset < 0
+        or source.chunk_end_offset <= source.chunk_start_offset
+        or source.chunk_end_offset > len(source.page_text)
+        or len(source.words) != expected_word_count
+    ):
+        raise EmbeddingPersistenceError("active chunk lacks complete canonical word evidence")
+    cursor = source.chunk_start_offset
+    for index, word in enumerate(source.words):
+        if (
+            not word.text
+            or word.start_offset != cursor
+            or word.end_offset != word.start_offset + len(word.text)
+            or word.end_offset > source.chunk_end_offset
+            or source.page_text[word.start_offset : word.end_offset] != word.text
+        ):
+            raise EmbeddingPersistenceError("active chunk canonical word evidence is invalid")
+        cursor = word.end_offset + (1 if index < len(source.words) - 1 else 0)
+    if (
+        source.words[-1].end_offset != source.chunk_end_offset
+        or source.page_text[source.chunk_start_offset : source.chunk_end_offset]
+        != source.chunk_text
+        or source.chunk_text != " ".join(word.text for word in source.words)
+    ):
+        raise EmbeddingPersistenceError("active chunk source slice is not canonical")
