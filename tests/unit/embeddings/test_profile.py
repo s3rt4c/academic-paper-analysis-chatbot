@@ -12,9 +12,21 @@ from academic_chatbot.embeddings.models import (
     EmbeddingSpanIdentity,
     artifact_set_sha256_for,
 )
-from academic_chatbot.embeddings.profile import canonical_profile_bytes, embedding_profile_id_for
+from academic_chatbot.embeddings.profile import (
+    approved_bge_small_en_v15_profile,
+    canonical_profile_bytes,
+    embedding_profile_id_for,
+)
 
 _FROZEN_PROFILE_ID = "ep-sha256-3f8fd2dbcff088eb61b2ef1ecbc6de57644a425722a586fef32059516146a929"
+
+
+def test_approved_bge_small_profile_reproduces_the_task0_identity() -> None:
+    profile = approved_bge_small_en_v15_profile()
+
+    assert profile.embedding_profile_id == _FROZEN_PROFILE_ID
+    assert profile.model_repository == "BAAI/bge-small-en-v1.5"
+    assert profile.model_revision == "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 
 
 def test_frozen_task0_profile_reproduces_its_exact_identity(

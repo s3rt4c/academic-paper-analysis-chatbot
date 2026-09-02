@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 from academic_chatbot.documents.import_service import DocumentImportService
 from academic_chatbot.documents.native_pdf import NativePdfParser
 from academic_chatbot.domain.library import Project
+from academic_chatbot.embeddings.artifacts import EmbeddingArtifactError, load_verified_artifacts
+from academic_chatbot.embeddings.embedder import OfflineEmbedder, OfflineEmbedderError
+from academic_chatbot.embeddings.models import canonical_json_bytes
+from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profile
+from academic_chatbot.embeddings.repository import EmbeddingPersistenceError, EmbeddingRepository
+from academic_chatbot.embeddings.vector_build import ProjectVectorBuilder, VectorBuildError
+from academic_chatbot.library.repository import ProjectRepository
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.retrieval.fts import RetrievalQueryError
 from academic_chatbot.retrieval.semantic import (
@@ -28,6 +37,10 @@ from academic_chatbot.retrieval.service import (
     RetrievalStorageError,
 )
 from academic_chatbot.storage.paths import ProjectPaths
+
+
+class SemanticIndexBuildError(ValueError):
+    """Stable user-facing failure for semantic-index build orchestration."""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -80,6 +93,12 @@ def _parser() -> argparse.ArgumentParser:
     imported.add_argument("--project-id", required=True)
     imported.add_argument("--paper-id", required=True)
     imported.add_argument("--source", required=True)
+    semantic_index = commands.add_parser("semantic-index")
+    semantic_build = semantic_index.add_subparsers(dest="semantic_index_command", required=True)
+    build = semantic_build.add_parser("build")
+    build.add_argument("--project-id", required=True)
+    build.add_argument("--embedding-profile-id", required=True)
+    build.add_argument("--model-root", required=True)
     search = commands.add_parser("search")
     search.add_argument("--project-id", required=True)
     search.add_argument("--query", required=True)
@@ -114,6 +133,8 @@ def _dispatch(library: LibraryService, arguments: argparse.Namespace) -> dict[st
             "file_version": file_version.model_dump(mode="json"),
             "generation": published.model_dump(mode="json"),
         }
+    if arguments.command == "semantic-index":
+        return _build_semantic_index(library, arguments)
     project = Project(project_id=arguments.project_id, display_name="retrieval")
     if arguments.mode == "semantic":
         if not arguments.embedding_profile_id or not arguments.model_root:
@@ -130,3 +151,66 @@ def _dispatch(library: LibraryService, arguments: argparse.Namespace) -> dict[st
         .search(project, arguments.query, limit=arguments.limit)
         .model_dump(mode="json")
     )
+
+
+def _build_semantic_index(
+    library: LibraryService, arguments: argparse.Namespace
+) -> dict[str, object]:
+    profile = approved_bge_small_en_v15_profile()
+    if arguments.embedding_profile_id != profile.embedding_profile_id:
+        raise SemanticIndexBuildError(
+            "semantic index build does not support this embedding profile"
+        )
+    paths = ProjectPaths.create(Path(arguments.data_root), project_id=arguments.project_id)
+    if not paths.database_path.is_file():
+        raise SemanticIndexBuildError("project does not exist")
+    if not ProjectRepository(paths).project_exists(arguments.project_id):
+        raise SemanticIndexBuildError("project does not exist")
+    try:
+        artifacts = load_verified_artifacts(Path(arguments.model_root), profile=profile)
+    except EmbeddingArtifactError as error:
+        if "does not exist" in str(error):
+            raise SemanticIndexBuildError("embedding model root is unavailable") from error
+        raise SemanticIndexBuildError("embedding artifact verification failed") from error
+    manifest_sha256 = hashlib.sha256(
+        canonical_json_bytes(artifacts.manifest.canonical_payload())
+    ).hexdigest()
+    repository = EmbeddingRepository(paths)
+    try:
+        repository.register_profile(profile, artifact_manifest_sha256=manifest_sha256)
+        embedder = OfflineEmbedder.open(Path(arguments.model_root), profile)
+        result = ProjectVectorBuilder(
+            paths=paths,
+            repository=repository,
+            profile=profile,
+            tokenizer=embedder._tokenizer,
+            embedder=embedder,
+        ).build(project_id=arguments.project_id)
+    except OfflineEmbedderError as error:
+        raise SemanticIndexBuildError(
+            "embedding tokenizer or runtime initialization failed"
+        ) from error
+    except EmbeddingPersistenceError as error:
+        raise SemanticIndexBuildError(
+            "semantic profile registration or publication failed"
+        ) from error
+    except VectorBuildError as error:
+        raise SemanticIndexBuildError("semantic vector build failed") from error
+    active = repository.active_generation(
+        project_id=arguments.project_id, embedding_profile_id=profile.embedding_profile_id
+    )
+    if active is None or active.vector_generation_id != result.generation.vector_generation_id:
+        raise SemanticIndexBuildError("semantic vector generation did not become active")
+    generation = result.generation
+    return {
+        "project_id": generation.project_id,
+        "embedding_profile_id": generation.embedding_profile_id,
+        "vector_generation_id": generation.vector_generation_id,
+        "source_snapshot_sha256": generation.source_snapshot_sha256,
+        "coverage": asdict(generation.coverage),
+        "artifact_relative_path": generation.artifact_relative_dir,
+        "active": True,
+        "current": True,
+        "empty": result.empty,
+        "reused": result.reused,
+    }

@@ -14,7 +14,7 @@ from typing import Protocol
 
 import numpy as np
 
-from academic_chatbot.embeddings.models import EmbeddingProfile, canonical_json_bytes
+from academic_chatbot.embeddings.models import EmbeddingProfile, EmbeddingRole, canonical_json_bytes
 from academic_chatbot.embeddings.repository import (
     ActiveChunkSource,
     EmbeddingPersistenceError,
@@ -45,13 +45,15 @@ class VectorBuildError(ValueError):
 
 
 class _DocumentTokenizer(Protocol):
-    profile: EmbeddingProfile
+    @property
+    def profile(self) -> EmbeddingProfile: ...
 
-    def prepare(self, role: object, texts: Sequence[str]) -> object: ...
+    def prepare(self, role: EmbeddingRole, texts: Sequence[str]) -> object: ...
 
 
 class _DocumentEmbedder(Protocol):
-    profile: EmbeddingProfile
+    @property
+    def profile(self) -> EmbeddingProfile: ...
 
     def embed_documents(self, texts: Sequence[str]) -> np.ndarray: ...
 
