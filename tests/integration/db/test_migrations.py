@@ -37,6 +37,7 @@ def test_new_database_reaches_document_core_migration_with_integrity_pragmas(
             (1,),
             (2,),
             (3,),
+            (4,),
         ]
         assert connection.execute("SELECT count(*) FROM projects").fetchone()[0] == 0
     finally:
@@ -134,7 +135,7 @@ def test_failed_migration_preserves_previous_valid_database(tmp_path: Path) -> N
     migration_directory.mkdir()
     for migration in _default_migration_directory().glob("*.sql"):
         shutil.copy2(migration, migration_directory)
-    (migration_directory / "0004_broken.sql").write_text(
+    (migration_directory / "0005_broken.sql").write_text(
         "CREATE TABLE transient_marker (value TEXT NOT NULL) STRICT;\nBROKEN SQL;\n",
         encoding="utf-8",
     )
@@ -151,6 +152,7 @@ def test_failed_migration_preserves_previous_valid_database(tmp_path: Path) -> N
             (1,),
             (2,),
             (3,),
+            (4,),
         ]
         transient_marker = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'transient_marker'"
@@ -227,7 +229,7 @@ def test_paper_scoped_file_version_migration_preserves_existing_evidence_lineage
         assert [
             tuple(row)
             for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
-        ] == [(1,), (2,), (3,)]
+        ] == [(1,), (2,), (3,), (4,)]
         assert tuple(
             connection.execute(
                 "SELECT file_version_id, paper_id, sha256, original_relative_path "
