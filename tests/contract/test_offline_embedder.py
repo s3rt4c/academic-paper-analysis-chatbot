@@ -25,6 +25,7 @@ def frozen_profile_payload() -> dict[str, object]:
 @pytest.mark.skipif(
     not os.environ.get(_REAL_ARTIFACT_ROOT), reason="requires pinned local BGE artifact root"
 )
+@pytest.mark.real_embedding
 def test_opt_in_real_bge_embedder_is_verified_cpu_only_and_offline(
     monkeypatch: pytest.MonkeyPatch, frozen_profile_payload: dict[str, object]
 ) -> None:

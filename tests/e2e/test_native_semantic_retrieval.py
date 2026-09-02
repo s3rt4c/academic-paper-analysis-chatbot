@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import socket
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
+from academic_chatbot.cli import main
 from academic_chatbot.documents.import_service import DocumentImportService
 from academic_chatbot.documents.native_pdf import NativePdfParser
 from academic_chatbot.domain.library import Project
+from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profile
 from academic_chatbot.embeddings.repository import EmbeddingRepository
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.retrieval.semantic import SemanticRetrievalService
@@ -53,3 +60,130 @@ def test_native_pdf_to_semantic_hit_preserves_active_evidence(tmp_path: Path) ->
     assert results.hits[0].file_version_id == file_version.file_version_id
     assert results.hits[0].paper_id == "paper-one"
     assert results.hits[0].anchors
+
+
+@dataclass(frozen=True)
+class _OfflineFake:
+    profile: object
+
+    @property
+    def _tokenizer(self) -> _TokenizerFake:
+        return _TokenizerFake(self.profile)
+
+    @classmethod
+    def open(cls, _model_root: Path, profile: object) -> _OfflineFake:
+        return cls(profile)
+
+    def embed_documents(self, texts: tuple[str, ...]) -> np.ndarray:
+        return _vectors(texts, dimension=self.profile.dimension)  # type: ignore[attr-defined]
+
+    def embed_queries(self, texts: tuple[str, ...]) -> np.ndarray:
+        return _vectors(texts, dimension=self.profile.dimension)  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True)
+class _TokenizerFake:
+    profile: object
+
+    def prepare(self, _role: object, _texts: tuple[str, ...]) -> object:
+        return object()
+
+
+class _ManifestFake:
+    def canonical_payload(self) -> dict[str, object]:
+        return {"manifest": "offline-fake-v1"}
+
+
+def _vectors(texts: tuple[str, ...], *, dimension: int) -> np.ndarray:
+    rows = np.empty((len(texts), dimension), dtype=np.float32)
+    for index, text in enumerate(texts):
+        raw = hashlib.sha256(text.encode("utf-8")).digest()
+        rows[index] = np.frombuffer((raw * 12)[:dimension], dtype=np.uint8).astype(np.float32)
+    rows += np.float32(1.0)
+    rows /= np.sqrt(np.sum(rows * rows, axis=1, keepdims=True, dtype=np.float32))
+    return rows
+
+
+def test_cli_native_pdf_build_then_semantic_search_is_offline_and_evidence_bearing(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("normal semantic application flow must remain offline and in-process")
+
+    for name in ("connect", "connect_ex", "send", "sendto"):
+        monkeypatch.setattr(socket.socket, name, forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    for name in ("Popen", "run", "call", "check_call", "check_output"):
+        monkeypatch.setattr(subprocess, name, forbidden)
+
+    def artifacts(_root: Path, *, profile: object) -> object:
+        assert profile == approved_bge_small_en_v15_profile()
+        return SimpleNamespace(manifest=_ManifestFake())
+
+    monkeypatch.setattr("academic_chatbot.cli.load_verified_artifacts", artifacts)
+    monkeypatch.setattr("academic_chatbot.cli.OfflineEmbedder", _OfflineFake)
+    monkeypatch.setattr("academic_chatbot.retrieval.semantic.load_verified_artifacts", artifacts)
+    monkeypatch.setattr("academic_chatbot.retrieval.semantic.OfflineEmbedder", _OfflineFake)
+    root = ["--data-root", str(tmp_path / "data"), "--max-pdf-bytes", "1000000"]
+    profile = approved_bge_small_en_v15_profile()
+
+    assert (
+        main([*root, "project", "create", "--project-id", "p", "--display-name", "Research"]) == 0
+    )
+    assert main([*root, "paper", "create", "--project-id", "p", "--paper-id", "paper"]) == 0
+    assert (
+        main(
+            [*root, "import-pdf", "--project-id", "p", "--paper-id", "paper", "--source", str(_PDF)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    build = [
+        *root,
+        "semantic-index",
+        "build",
+        "--project-id",
+        "p",
+        "--embedding-profile-id",
+        profile.embedding_profile_id,
+        "--model-root",
+        str(tmp_path / "models"),
+    ]
+    assert main(build) == 0
+    build_payload = json.loads(capsys.readouterr().out)
+    assert build_payload["active"] is True
+    assert build_payload["current"] is True
+    assert build_payload["empty"] is False
+    assert build_payload["coverage"]["embeddable_spans"] > 0
+    assert main(build) == 0
+    reused_payload = json.loads(capsys.readouterr().out)
+    assert reused_payload["reused"] is True
+    assert reused_payload["vector_generation_id"] == build_payload["vector_generation_id"]
+
+    assert main([*root, "search", "--project-id", "p", "--query", "accuracy"]) == 0
+    lexical = json.loads(capsys.readouterr().out)
+    assert lexical["hits"]
+    assert (
+        main(
+            [
+                *root,
+                "search",
+                "--mode",
+                "semantic",
+                "--project-id",
+                "p",
+                "--query",
+                "accuracy",
+                "--embedding-profile-id",
+                profile.embedding_profile_id,
+                "--model-root",
+                str(tmp_path / "models"),
+            ]
+        )
+        == 0
+    )
+    semantic = json.loads(capsys.readouterr().out)
+    assert semantic["vector_generation_id"] == build_payload["vector_generation_id"]
+    assert semantic["hits"][0]["paper_id"] == "paper"
+    assert semantic["hits"][0]["anchors"]
+    assert semantic["hits"][0]["raw_semantic_score"] > 0.0
