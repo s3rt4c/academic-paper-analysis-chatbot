@@ -130,7 +130,7 @@ def _hit_from_row(connection: sqlite3.Connection, *, row: sqlite3.Row, rank: int
             for anchor_row in anchor_rows
         ):
             raise RetrievalIntegrityError("persisted anchor extends outside its chunk range")
-        anchors = tuple(_anchor_from_row(row, anchor_row) for anchor_row in anchor_rows)
+        anchors = tuple(anchor_from_row(row, anchor_row) for anchor_row in anchor_rows)
         return RetrievalHit(
             project_id=str(row["project_id"]), paper_id=str(row["paper_id"]),
             file_version_id=str(row["file_version_id"]),
@@ -146,7 +146,8 @@ def _hit_from_row(connection: sqlite3.Connection, *, row: sqlite3.Row, rank: int
         raise RetrievalIntegrityError("persisted evidence is malformed") from error
 
 
-def _anchor_from_row(row: sqlite3.Row, anchor_row: sqlite3.Row) -> NativePdfAnchor:
+def anchor_from_row(row: sqlite3.Row, anchor_row: sqlite3.Row) -> NativePdfAnchor:
+    """Reconstruct one validated native anchor from persisted canonical evidence."""
     box = PdfAnchorBox(
         char_start=int(anchor_row["char_start"]), char_end=int(anchor_row["char_end"]),
         x0=float(anchor_row["x0"]), top=float(anchor_row["top"]),

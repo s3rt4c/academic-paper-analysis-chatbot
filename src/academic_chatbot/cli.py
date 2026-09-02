@@ -13,6 +13,15 @@ from academic_chatbot.documents.native_pdf import NativePdfParser
 from academic_chatbot.domain.library import Project
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.retrieval.fts import RetrievalQueryError
+from academic_chatbot.retrieval.semantic import (
+    SemanticArtifactIntegrityError,
+    SemanticIndexStaleError,
+    SemanticIndexUnavailableError,
+    SemanticProfileError,
+    SemanticQueryError,
+    SemanticRetrievalIntegrityError,
+    SemanticRetrievalService,
+)
 from academic_chatbot.retrieval.service import (
     RetrievalIntegrityError,
     RetrievalService,
@@ -41,6 +50,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         RetrievalStorageError,
         RetrievalIntegrityError,
         ValueError,
+        SemanticArtifactIntegrityError,
+        SemanticIndexStaleError,
+        SemanticIndexUnavailableError,
+        SemanticProfileError,
+        SemanticQueryError,
+        SemanticRetrievalIntegrityError,
     ) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -69,6 +84,9 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("--project-id", required=True)
     search.add_argument("--query", required=True)
     search.add_argument("--limit", type=int, default=10)
+    search.add_argument("--mode", choices=("lexical", "semantic"), default="lexical")
+    search.add_argument("--embedding-profile-id")
+    search.add_argument("--model-root")
     return parser
 
 
@@ -83,7 +101,8 @@ def _dispatch(library: LibraryService, arguments: argparse.Namespace) -> dict[st
         ).model_dump(mode="json")
     if arguments.command == "import-pdf":
         file_version = library.admit_pdf(
-            project_id=arguments.project_id, paper_id=arguments.paper_id,
+            project_id=arguments.project_id,
+            paper_id=arguments.paper_id,
             source_path=Path(arguments.source),
         )
         paths = ProjectPaths.create(Path(arguments.data_root), project_id=arguments.project_id)
@@ -96,6 +115,18 @@ def _dispatch(library: LibraryService, arguments: argparse.Namespace) -> dict[st
             "generation": published.model_dump(mode="json"),
         }
     project = Project(project_id=arguments.project_id, display_name="retrieval")
-    return RetrievalService(data_root=Path(arguments.data_root)).search(
-        project, arguments.query, limit=arguments.limit
-    ).model_dump(mode="json")
+    if arguments.mode == "semantic":
+        if not arguments.embedding_profile_id or not arguments.model_root:
+            raise ValueError("semantic search requires --embedding-profile-id and --model-root")
+        results = SemanticRetrievalService.open_from_model_root(
+            data_root=Path(arguments.data_root),
+            project_id=arguments.project_id,
+            profile_id=arguments.embedding_profile_id,
+            model_root=Path(arguments.model_root),
+        ).search(project, arguments.query, limit=arguments.limit)
+        return {"mode": "semantic", **results.model_dump(mode="json")}
+    return (
+        RetrievalService(data_root=Path(arguments.data_root))
+        .search(project, arguments.query, limit=arguments.limit)
+        .model_dump(mode="json")
+    )
