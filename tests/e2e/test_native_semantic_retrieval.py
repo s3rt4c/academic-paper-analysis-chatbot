@@ -187,3 +187,32 @@ def test_cli_native_pdf_build_then_semantic_search_is_offline_and_evidence_beari
     assert semantic["hits"][0]["paper_id"] == "paper"
     assert semantic["hits"][0]["anchors"]
     assert semantic["hits"][0]["raw_semantic_score"] > 0.0
+
+    hybrid_arguments = [
+        *root,
+        "search",
+        "--mode",
+        "hybrid",
+        "--project-id",
+        "p",
+        "--query",
+        "accuracy",
+        "--embedding-profile-id",
+        profile.embedding_profile_id,
+        "--model-root",
+        str(tmp_path / "models"),
+    ]
+    assert main(hybrid_arguments) == 0
+    hybrid = json.loads(capsys.readouterr().out)
+    assert hybrid["mode"] == "hybrid"
+    assert hybrid["fusion_profile_id"] == "rrf-v1"
+    assert hybrid["lexical_state"] == "healthy_results"
+    assert hybrid["semantic_state"] == "healthy_results"
+    assert hybrid["hits"]
+    hit = hybrid["hits"][0]
+    assert hit["trace"]["channel_membership"] == "both"
+    assert hit["lexical_contribution"]["lexical_hit"]["anchors"]
+    assert hit["semantic_contribution"]["semantic_hit"]["anchors"]
+
+    assert main(hybrid_arguments) == 0
+    assert json.loads(capsys.readouterr().out) == hybrid
