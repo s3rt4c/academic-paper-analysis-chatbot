@@ -22,6 +22,10 @@ from academic_chatbot.embeddings.vector_build import ProjectVectorBuilder, Vecto
 from academic_chatbot.library.repository import ProjectRepository
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.retrieval.fts import RetrievalQueryError
+from academic_chatbot.retrieval.hybrid_service import (
+    HybridRetrievalIntegrityError,
+    HybridRetrievalService,
+)
 from academic_chatbot.retrieval.semantic import (
     SemanticArtifactIntegrityError,
     SemanticIndexStaleError,
@@ -63,6 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         RetrievalStorageError,
         RetrievalIntegrityError,
         ValueError,
+        HybridRetrievalIntegrityError,
         SemanticArtifactIntegrityError,
         SemanticIndexStaleError,
         SemanticIndexUnavailableError,
@@ -103,7 +108,7 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("--project-id", required=True)
     search.add_argument("--query", required=True)
     search.add_argument("--limit", type=int, default=10)
-    search.add_argument("--mode", choices=("lexical", "semantic"), default="lexical")
+    search.add_argument("--mode", choices=("lexical", "semantic", "hybrid"), default="lexical")
     search.add_argument("--embedding-profile-id")
     search.add_argument("--model-root")
     return parser
@@ -136,16 +141,26 @@ def _dispatch(library: LibraryService, arguments: argparse.Namespace) -> dict[st
     if arguments.command == "semantic-index":
         return _build_semantic_index(library, arguments)
     project = Project(project_id=arguments.project_id, display_name="retrieval")
-    if arguments.mode == "semantic":
+    if arguments.mode in ("semantic", "hybrid"):
         if not arguments.embedding_profile_id or not arguments.model_root:
-            raise ValueError("semantic search requires --embedding-profile-id and --model-root")
-        results = SemanticRetrievalService.open_from_model_root(
+            raise ValueError(
+                f"{arguments.mode} search requires --embedding-profile-id and --model-root"
+            )
+        if arguments.mode == "semantic":
+            semantic_results = SemanticRetrievalService.open_from_model_root(
+                data_root=Path(arguments.data_root),
+                project_id=arguments.project_id,
+                profile_id=arguments.embedding_profile_id,
+                model_root=Path(arguments.model_root),
+            ).search(project, arguments.query, limit=arguments.limit)
+            return {"mode": "semantic", **semantic_results.model_dump(mode="json")}
+        hybrid_results = HybridRetrievalService.open_from_model_root(
             data_root=Path(arguments.data_root),
             project_id=arguments.project_id,
             profile_id=arguments.embedding_profile_id,
             model_root=Path(arguments.model_root),
         ).search(project, arguments.query, limit=arguments.limit)
-        return {"mode": "semantic", **results.model_dump(mode="json")}
+        return {"mode": "hybrid", **hybrid_results.model_dump(mode="json")}
     return (
         RetrievalService(data_root=Path(arguments.data_root))
         .search(project, arguments.query, limit=arguments.limit)
