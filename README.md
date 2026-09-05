@@ -17,9 +17,11 @@ private, local-only semantic retrieval path to the Phase 1A document core.
 This is not hybrid retrieval, a full document workspace, an evidence-chat
 interface, or a representative 50–300-paper performance certification.
 
-**Phase 1C–4 remain planned.** This repository does not yet provide hybrid
-retrieval, reranking, OCR execution, LLM analysis, an API/UI, academic
-discovery, background workers, or release packaging.
+**Phase 1C — deterministic hybrid retrieval: complete and ready for a separate
+publication review.** It composes the accepted lexical and semantic channels
+under the frozen `rrf-v1` profile. Reranking, OCR execution, LLM analysis,
+an API/UI, academic discovery, background workers, and release packaging
+remain outside this completed slice.
 
 ## What Phase 0 validates
 
@@ -59,6 +61,28 @@ OCR execution, embeddings, vector and hybrid retrieval, reranking, LLM analysis/
 The accepted reference-class measurements and gate outcomes are recorded in
 [`benchmarks/results/semantic-retrieval-phase1b.json`](benchmarks/results/semantic-retrieval-phase1b.json).
 They are local acceptance evidence, not general support guarantees.
+
+## What Phase 1C provides
+
+- Deterministic lexical plus semantic retrieval using frozen `rrf-v1`: exact
+  unweighted reciprocal-rank fusion with `k=40` and equal channel weights.
+- One result per parent Chunk identity, while semantic multi-span candidates
+  collapse to one representative vote and retain their exact span evidence.
+- Read-only orchestration that preserves separate lexical and semantic raw
+  scores and anchors, then resolves honest current parent context.
+- Explicit fail-closed behavior for unavailable, stale, or corrupt semantic
+  state; hybrid search never silently becomes lexical-only when semantic
+  health is required.
+- `search --mode hybrid` with explicit semantic profile and model inputs.
+  Lexical search remains the default mode, and the application does not
+  acquire models at runtime.
+
+The rights-safe synthetic evaluation and final acceptance facts are recorded
+in [`benchmarks/results/hybrid-retrieval-phase1c.json`](benchmarks/results/hybrid-retrieval-phase1c.json).
+Its lexical, semantic, and hybrid values are deterministic fixture results,
+not a claim that hybrid is 100% accurate or generally superior to either
+channel. Representative, diverse academic-corpus retrieval quality and
+retrieval scale remain unvalidated.
 
 ## Architecture direction
 
@@ -105,6 +129,7 @@ tools/                Documentation and fixture support tools
 - **Phase 0 — Technical feasibility:** complete
 - **Phase 1A — Local document core:** complete
 - **Phase 1B — Native-text semantic retrieval foundation:** complete
+- **Phase 1C — Deterministic hybrid retrieval:** complete; publication review pending
 - **Phase 2 — Deep analysis and Evidence Chat:** planned
 - **Phase 3 — Academic discovery:** planned
 - **Phase 4 — Packaging and hardening:** planned
@@ -129,6 +154,12 @@ tools/                Documentation and fixture support tools
 - Phase 1B's repeated public synthetic span study does not certify diverse
   50-, 100-, or 300-paper academic-corpus latency, token-length distribution,
   excluded-unembeddable incidence, or large-corpus query P95.
+- Phase 1C does not certify representative academic-corpus retrieval quality,
+  real-BGE semantic quality, production-scale latency, 50/100/300-paper
+  retrieval performance, large-corpus ranking stability, or hybrid
+  superiority on arbitrary corpora. OCR execution, reranking, LLM analysis,
+  citation-verification analysis, API/UI, jobs/workers, ANN, automatic model
+  acquisition, and representative large-corpus certification remain deferred.
 
 ## Development setup
 
@@ -173,6 +204,7 @@ $maxPdfBytes = 100000000
 .venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes import-pdf --project-id research --paper-id paper-one --source <local-pdf-path>
 .venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes semantic-index build --project-id research --embedding-profile-id $profile --model-root $modelRoot
 .venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes search --mode semantic --project-id research --query "accuracy" --embedding-profile-id $profile --model-root $modelRoot
+.venv\Scripts\python.exe -m academic_chatbot --data-root $dataRoot --max-pdf-bytes $maxPdfBytes search --mode hybrid --project-id research --query "accuracy" --embedding-profile-id $profile --model-root $modelRoot
 ```
 
 For the opt-in real frozen-model contract, set
