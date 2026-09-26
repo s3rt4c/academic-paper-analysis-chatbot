@@ -23,6 +23,15 @@ under the frozen `rrf-v1` profile. Reranking, OCR execution, LLM analysis,
 an API/UI, academic discovery, background workers, and release packaging
 remain outside this completed slice.
 
+**Phase 2 — bounded evidence preparation and a supported-objective verifier:
+implemented in a deliberately narrow form.** The public evidence layer resolves
+explicit references against authoritative source/version/generation state,
+packs deterministic byte-bounded previews, and represents explicit two-child
+`EvidenceGroup` values. Analysis proposal objects are caller assertions, not
+decisions. The supported-objective verifier accepts only caller-asserted
+`SupportedProposal` values, requires exact UTF-8 equality for every standalone
+citation, and abstains from scalar projection for `EvidenceGroup` values.
+
 ## What Phase 0 validates
 
 - Reproducible Python packaging and strict test/tool configuration.
@@ -84,6 +93,29 @@ not a claim that hybrid is 100% accurate or generally superior to either
 channel. Representative, diverse academic-corpus retrieval quality and
 retrieval scale remain unvalidated.
 
+## What the implemented Phase 2 slice provides
+
+- Authoritative, source-scoped evidence-reference validation and deterministic,
+  byte- and entry-bounded evidence packing.
+- EvidenceBundle preview through the local CLI, with citation labels, source
+  lineage, coverage facts, and generation disabled.
+- Explicit `EvidenceGroup` v1 representation for exactly two known members.
+  Automatic member discovery is not implemented.
+- Caller-asserted objective proposal contracts. These contracts do not select a
+  status or establish that a proposal is true.
+- A deterministic supported-objective citation verifier for standalone evidence
+  using exact `value.encode("utf-8")` equality with authoritative cited text.
+  It performs no normalization, paraphrase matching, or semantic entailment.
+- Full structural/currentness validation for `EvidenceGroup`; scalar value
+  projection then abstains with
+  `evidence_group_value_projection_unsupported`.
+
+Public evidence-preparation acceptance for the tree at the EvidenceGroup
+boundary is recorded in
+[`benchmarks/results/evidence-bundle-phase2.json`](benchmarks/results/evidence-bundle-phase2.json).
+The acceptance record does not claim evidence completeness, retrieval recall,
+support classification, or generation readiness.
+
 ## Architecture direction
 
 The planned system is a local RAG research assistant with PDF ingestion, extraction/OCR, section-aware chunking, FTS plus dense retrieval, evidence spans, citation verification, staged deep analysis, SQLite-backed local state, and a resource governor. See [docs/architecture.md](docs/architecture.md) for the public design summary.
@@ -130,7 +162,7 @@ tools/                Documentation and fixture support tools
 - **Phase 1A — Local document core:** complete
 - **Phase 1B — Native-text semantic retrieval foundation:** complete
 - **Phase 1C — Deterministic hybrid retrieval:** complete; publication review pending
-- **Phase 2 — Deep analysis and Evidence Chat:** planned
+- **Phase 2 — Evidence preparation and supported-objective exact-text verification:** bounded public slice implemented; broader deep analysis and Evidence Chat remain future work
 - **Phase 3 — Academic discovery:** planned
 - **Phase 4 — Packaging and hardening:** planned
 
@@ -157,9 +189,17 @@ tools/                Documentation and fixture support tools
 - Phase 1C does not certify representative academic-corpus retrieval quality,
   real-BGE semantic quality, production-scale latency, 50/100/300-paper
   retrieval performance, large-corpus ranking stability, or hybrid
-  superiority on arbitrary corpora. OCR execution, reranking, LLM analysis,
-  citation-verification analysis, API/UI, jobs/workers, ANN, automatic model
-  acquisition, and representative large-corpus certification remain deferred.
+  superiority on arbitrary corpora. Within that Phase 1C slice, OCR execution,
+  reranking, LLM analysis, citation-verification analysis, API/UI, jobs/workers,
+  ANN, automatic model acquisition, and representative large-corpus
+  certification remained deferred.
+- The Phase 2 verifier is supported-only and caller-asserted. No paraphrase or
+  semantic-entailment verifier exists; no production `not_reported`, inference,
+  conflict, or unreadable decision engine exists.
+- Evidence completeness and retrieval recall are not guaranteed. Retrieval
+  absence must not be interpreted as `not_reported`.
+- Generation remains disabled. Tokenizer/model-facing answer generation and
+  production `llama.cpp` answer generation are not implemented.
 
 ## Development setup
 
