@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from academic_chatbot.db.connection import connect_project_database
+from academic_chatbot.retrieval import selection
 from academic_chatbot.retrieval.hybrid_fusion import fuse_candidates
 from academic_chatbot.retrieval.hybrid_models import HybridChannelMembership
 from academic_chatbot.retrieval.hybrid_service import (
@@ -163,6 +164,26 @@ def test_hybrid_search_keeps_semantic_only_evidence_when_lexical_is_healthy_empt
     assert len(results.hits) == 1
     assert results.hits[0].lexical_contribution is None
     assert results.hits[0].semantic_contribution is not None
+
+
+def test_ordinary_hybrid_search_does_not_invoke_guarded_selector(tmp_path, monkeypatch) -> None:
+    semantic, _, repository, _ = _active_service(tmp_path)
+    paths = repository._paths  # type: ignore[attr-defined]
+
+    def forbidden(**_kwargs):
+        pytest.fail("ordinary hybrid search must not invoke guarded selection")
+
+    monkeypatch.setattr(selection, "select_guarded_earliest_auxiliary", forbidden)
+    service = HybridRetrievalService(
+        data_root=paths.data_root,
+        lexical_service=RetrievalService(data_root=paths.data_root),
+        semantic_service=semantic,
+    )
+
+    result = service.search(_project_value(), "ordinary query", limit=10)
+
+    assert result.fusion_profile_id == "rrf-v1"
+    assert result.hits
 
 
 def test_parent_resolver_refuses_a_candidate_generation_after_active_generation_changes(tmp_path) -> None:

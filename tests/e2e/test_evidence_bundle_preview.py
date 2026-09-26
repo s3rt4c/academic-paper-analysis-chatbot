@@ -10,8 +10,20 @@ from pathlib import PurePath
 import pytest
 
 from academic_chatbot import cli
+from academic_chatbot.domain.library import Project
 from academic_chatbot.evidence.models import PreviewBudget
-from tests.fixtures.evidence_bundle.database import database
+from academic_chatbot.evidence.references import candidate_ref_from_semantic
+from academic_chatbot.evidence.resolver import EvidenceReadResolver
+from academic_chatbot.evidence.service import EvidenceBundleService
+from academic_chatbot.retrieval.selection import (
+    CanonicalPosition,
+    occurrence_identity,
+    select_guarded_earliest_auxiliary,
+)
+from academic_chatbot.retrieval.semantic import SemanticRetrievalService
+from academic_chatbot.retrieval.semantic_position import SemanticPositionalAcquisition
+from tests.fixtures.evidence_bundle.database import _SyntheticQueryEmbedder, database
+from tests.integration.embeddings.test_vector_publication import _profile
 from tests.integration.evidence.test_read_only import install_preview_guards
 
 
@@ -91,6 +103,67 @@ def assert_bundle(raw, request):
     assert payload["budget"]["used_content_bytes"] == len(canonical(payload["content_preview"]))
     assert payload["budget"]["used_entries"] == len(payload["entries"])
     return payload
+
+
+def test_guarded_selector_order_survives_resolver_and_packing(tmp_path):
+    db = database(tmp_path)
+    prepared = db.semantic(maximum_words=1)
+    profile = _profile()
+    service = SemanticRetrievalService(
+        data_root=db.paths.data_root,
+        profile=profile,
+        embedder=_SyntheticQueryEmbedder(profile),
+    )
+    hits = service.search(
+        Project(project_id="project-one", display_name="Synthetic"),
+        "alpha",
+        limit=100,
+    ).hits
+    assert len(hits) >= 9
+
+    acquisition = SemanticPositionalAcquisition(
+        project_id=hits[0].project_id,
+        query="alpha",
+        embedding_profile_id=hits[0].embedding_profile_id,
+        vector_generation_id=hits[0].vector_generation_id,
+        policy_id="semantic-positional-acquisition-v1",
+        concern_id="stated-study-objective-v1",
+        requested_limit=1,
+        examined_hits=hits[:9],
+        baseline_hits=hits[:1],
+        positional_hits=hits[1:9],
+        ordered_hits=hits[:9],
+    )
+    positions = {
+        occurrence_identity(hit): CanonicalPosition(
+            occurrence_identity=occurrence_identity(hit),
+            document_generation_id=hit.document_generation_id,
+            page_id=hit.page_id,
+            absolute_start=hit.start_offset,
+            source_policy_id="semantic-positional-acquisition-v1",
+        )
+        for hit in acquisition.ordered_hits
+    }
+    selected = select_guarded_earliest_auxiliary(
+        acquisition=acquisition,
+        current=acquisition.baseline_hits,
+        positions=positions,
+        selector_policy_id="guarded-earliest-aux-selector-v1",
+    )
+    references = tuple(candidate_ref_from_semantic(hit) for hit in selected)
+    request = prepared.model_copy(
+        update={
+            "candidates": references,
+            "preview_budget": PreviewBudget(),
+        }
+    )
+
+    bundle = EvidenceBundleService(
+        resolver=EvidenceReadResolver(data_root=db.paths.data_root)
+    ).build(request)
+
+    assert tuple(disposition.reference for disposition in bundle.dispositions) == references
+    assert tuple(entry.citation_label for entry in bundle.entries) == ("E1", "E2")
 
 
 @pytest.mark.parametrize("mode", ["lexical", "semantic", "hybrid"])

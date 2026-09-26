@@ -18,6 +18,11 @@ from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profil
 from academic_chatbot.embeddings.repository import EmbeddingRepository
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.retrieval.hybrid_service import HybridRetrievalService
+from academic_chatbot.retrieval.selection import (
+    CanonicalPosition,
+    occurrence_identity,
+    select_guarded_earliest_auxiliary,
+)
 from academic_chatbot.retrieval.semantic import SemanticRetrievalService
 from academic_chatbot.retrieval.semantic_position import PositionalAcquisitionSelection
 from academic_chatbot.retrieval.semantic_query import (
@@ -107,6 +112,41 @@ def test_native_positional_acquisition_is_additive_and_bounded(tmp_path: Path) -
     assert acquisition.ordered_hits[: len(baseline.hits)] == baseline.hits
     assert len(acquisition.examined_hits) <= 100
     assert len(acquisition.positional_hits) <= 32
+
+
+def test_native_guarded_selector_preserves_current_lineage(tmp_path: Path) -> None:
+    service, project_value, _, _, _, _ = _native_fixture(tmp_path)
+    acquisition = service.acquire_positional(
+        project_value,
+        "semantic native",
+        limit=1,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+    positions = {
+        occurrence_identity(hit): CanonicalPosition(
+            occurrence_identity=occurrence_identity(hit),
+            document_generation_id=hit.document_generation_id,
+            page_id=hit.page_id,
+            absolute_start=hit.start_offset,
+            source_policy_id="semantic-positional-acquisition-v1",
+        )
+        for hit in acquisition.ordered_hits
+    }
+
+    selected = select_guarded_earliest_auxiliary(
+        acquisition=acquisition,
+        current=acquisition.baseline_hits,
+        positions=positions,
+        selector_policy_id="guarded-earliest-aux-selector-v1",
+    )
+
+    assert selected == acquisition.baseline_hits
+    assert selected[0].project_id == project_value.project_id
+    assert selected[0].file_version_id == acquisition.baseline_hits[0].file_version_id
+    assert selected[0].document_generation_id == acquisition.baseline_hits[0].document_generation_id
+    assert selected[0].vector_generation_id == acquisition.vector_generation_id
 
 
 def test_native_hybrid_positional_acquisition_preserves_rrf_contract(tmp_path: Path) -> None:

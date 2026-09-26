@@ -12,6 +12,11 @@ import pytest
 from academic_chatbot.db.connection import connect_project_database
 from academic_chatbot.domain.library import Project
 from academic_chatbot.embeddings.models import EmbeddingProfile, canonical_json_bytes
+from academic_chatbot.retrieval.selection import (
+    CanonicalPosition,
+    occurrence_identity,
+    select_guarded_earliest_auxiliary,
+)
 from academic_chatbot.retrieval.semantic import (
     SemanticArtifactIntegrityError,
     SemanticIndexStaleError,
@@ -224,6 +229,39 @@ def test_positional_acquisition_returns_baseline_and_auxiliary_hits(tmp_path: Pa
     assert acquisition.baseline_hits == acquisition.examined_hits
     assert acquisition.positional_hits == ()
     assert acquisition.ordered_hits == acquisition.baseline_hits
+
+
+def test_guarded_selector_preserves_real_underfilled_acquisition(tmp_path: Path) -> None:
+    service, _, _, _ = _active_service(tmp_path)
+    acquisition = service.acquire_positional(
+        _project_value(),
+        "meaningful query",
+        limit=1,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+    positions = {
+        occurrence_identity(hit): CanonicalPosition(
+            occurrence_identity=occurrence_identity(hit),
+            document_generation_id=hit.document_generation_id,
+            page_id=hit.page_id,
+            absolute_start=hit.start_offset,
+            source_policy_id="semantic-positional-acquisition-v1",
+        )
+        for hit in acquisition.ordered_hits
+    }
+    before = acquisition
+
+    selected = select_guarded_earliest_auxiliary(
+        acquisition=acquisition,
+        current=acquisition.baseline_hits,
+        positions=positions,
+        selector_policy_id="guarded-earliest-aux-selector-v1",
+    )
+
+    assert selected == acquisition.baseline_hits
+    assert acquisition == before
 
 
 def test_positional_acquisition_preserves_original_query_and_selected_representation(
