@@ -8,12 +8,14 @@ import os
 import re
 import shutil
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
+from io import BytesIO
 from mmap import mmap
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Self, cast
+from typing import Any, BinaryIO, Literal, Self, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,6 +28,111 @@ _METADATA_FILENAME = "vectors.meta.json"
 _MANIFEST_FILENAME = "manifest.json"
 _NPY_VERSION = (2, 0)
 _VERIFY_BLOCK_ROWS = 65_536
+
+
+@dataclass(frozen=True, slots=True)
+class VectorOpenLimits:
+    """Caller-supplied admission limits; no evidence-specific policy defaults."""
+
+    max_manifest_bytes: int
+    max_metadata_bytes: int
+    max_vectors_file_bytes: int
+    max_rows: int
+    expected_dimension: int
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.max_manifest_bytes, self.max_metadata_bytes, self.max_vectors_file_bytes,
+            self.max_rows, self.expected_dimension,
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError("Vector opening limits must be strictly positive integers")
+
+
+class VectorOpenLimitError(ValueError):
+    """An artifact exceeds the caller's explicit admission policy."""
+
+
+@contextmanager
+def _bounded_binary_handle(path: Path) -> Iterator[BinaryIO]:
+    handle = path.open("rb")
+    try:
+        yield handle
+    except BaseException:
+        # Cleanup must not replace the primary verification/admission failure.
+        with suppress(BaseException):
+            handle.close()
+        raise
+    else:
+        handle.close()
+
+
+def _file_state(state: os.stat_result) -> tuple[int, int, int, int]:
+    # Windows stat and fstat can expose different ctime semantics. Compare
+    # ctime only between fstat snapshots, never across the two APIs.
+    return (state.st_dev, state.st_ino, state.st_size, state.st_mtime_ns)
+
+
+def _assert_file_unchanged(handle: BinaryIO, path: Path, initial: os.stat_result) -> None:
+    expected = _file_state(initial)
+    current = os.fstat(handle.fileno())
+    if (_file_state(current) != expected or current.st_ctime_ns != initial.st_ctime_ns
+            or _file_state(path.stat()) != expected):
+        raise ValueError("Artifact changed during bounded verification")
+
+
+def _read_bounded_bytes(handle: BinaryIO, maximum: int) -> bytes:
+    raw = handle.read(maximum + 1)
+    if len(raw) > maximum:
+        raise VectorOpenLimitError("Artifact exceeds the supplied byte limit")
+    return raw
+
+
+def _bounded_json_object(raw: bytes) -> dict[str, object]:
+    try:
+        loaded: Any = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Artifact is not valid UTF-8 JSON") from error
+    if not isinstance(loaded, dict):
+        raise ValueError("Artifact must contain a JSON object")
+    return cast(dict[str, object], loaded)
+
+
+def _hash_bounded_stream(handle: BinaryIO, maximum: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    while True:
+        block = handle.read(min(1024 * 1024, maximum - total + 1))
+        total += len(block)
+        if total > maximum:
+            raise VectorOpenLimitError("Vector file exceeds the supplied byte limit")
+        if not block:
+            return digest.hexdigest(), total
+        digest.update(block)
+
+
+def _read_bounded_npy_header(
+    handle: BinaryIO, *, max_header_bytes: int, file_bytes: int | None = None,
+) -> tuple[tuple[int, ...], bool, np.dtype[Any], int]:
+    if np.lib.format.read_magic(handle) != _NPY_VERSION:
+        raise ValueError("vectors.npy must use NPY version 2.0")
+    encoded_length = handle.read(4)
+    if len(encoded_length) != 4:
+        raise ValueError("Truncated NPY header length")
+    length = int.from_bytes(encoded_length, "little")
+    if length > max_header_bytes:
+        raise VectorOpenLimitError("NPY header exceeds the supplied manifest-byte limit")
+    if file_bytes is not None and 12 + length > file_bytes:
+        raise ValueError("NPY header exceeds the verified file extent")
+    body = handle.read(length)
+    if len(body) != length:
+        raise ValueError("Truncated NPY header")
+    # NumPy parses only the already-admitted in-memory header bytes. The payload
+    # is never handed to an unrestricted np.load or a second disk header parser.
+    shape, order, dtype = np.lib.format.read_array_header_2_0(
+        BytesIO(encoded_length + body), max_header_size=max_header_bytes,
+    )
+    return shape, order, dtype, 12 + length
 
 
 def _canonical_json_bytes(payload: Mapping[str, object]) -> bytes:
@@ -415,13 +522,101 @@ class ExactVectorStore:
             _remove_staging_directory(staging_dir, staging_root)
 
     @classmethod
-    def open(cls, generation_dir: Path) -> Self:
+    def open(cls, generation_dir: Path, *, limits: VectorOpenLimits | None = None) -> Self:
+        if limits is not None:
+            return cls._open_bounded(Path(generation_dir), limits=limits)
         return cls._open_verified(
             Path(generation_dir),
             expected_manifest=None,
             require_generation_name=True,
             require_manifest=True,
         )
+
+    @classmethod
+    def _open_bounded(cls, generation_dir: Path, *, limits: VectorOpenLimits) -> Self:
+        mapping: np.memmap[Any, Any] | None = None
+        try:
+            with ExitStack() as stack:
+                files: list[tuple[BinaryIO, Path, os.stat_result]] = []
+
+                def opening(name: str) -> BinaryIO:
+                    path = generation_dir / name
+                    handle = stack.enter_context(_bounded_binary_handle(path))
+                    initial = os.fstat(handle.fileno())
+                    _assert_file_unchanged(handle, path, initial)
+                    files.append((handle, path, initial))
+                    return handle
+
+                raw = _read_bounded_bytes(opening(_MANIFEST_FILENAME), limits.max_manifest_bytes)
+                manifest = VectorGenerationManifest.model_validate(_bounded_json_object(raw))
+                if raw != _canonical_json_file_bytes(manifest.model_dump(mode="json")):
+                    raise ValueError("manifest.json is not canonical UTF-8 JSON")
+                if generation_dir.name != manifest.generation_id:
+                    raise ValueError("Generation directory name does not match generation_id")
+                if manifest.row_count > limits.max_rows:
+                    raise VectorOpenLimitError("Vector row count exceeds the supplied limit")
+                if manifest.dimension != limits.expected_dimension:
+                    raise VectorOpenLimitError("Vector dimension does not match the supplied limit")
+                if manifest.vectors_file_bytes > limits.max_vectors_file_bytes:
+                    raise VectorOpenLimitError("Declared vector size exceeds the supplied limit")
+                if manifest.metadata_file_bytes > limits.max_metadata_bytes:
+                    raise VectorOpenLimitError("Declared metadata size exceeds the supplied limit")
+
+                raw = _read_bounded_bytes(opening(_METADATA_FILENAME), limits.max_metadata_bytes)
+                if len(raw) != manifest.metadata_file_bytes:
+                    raise ValueError("vectors.meta.json file size does not match the manifest")
+                if not hmac.compare_digest(
+                    hashlib.sha256(raw).hexdigest(), manifest.metadata_sha256
+                ):
+                    raise ValueError("vectors.meta.json SHA-256 does not match the manifest")
+                metadata = _VectorMetadata.model_validate(_bounded_json_object(raw))
+                if raw != _canonical_json_file_bytes(metadata.model_dump(mode="json")):
+                    raise ValueError("vectors.meta.json is not canonical UTF-8 JSON")
+                if metadata.row_count != manifest.row_count:
+                    raise ValueError("Metadata row count does not match the manifest")
+                if metadata.row_id_kind != manifest.row_id_kind:
+                    raise ValueError("Metadata row ID kind does not match the manifest")
+
+                handle = opening(_VECTOR_FILENAME)
+                digest, size = _hash_bounded_stream(handle, limits.max_vectors_file_bytes)
+                if size != manifest.vectors_file_bytes:
+                    raise ValueError("vectors.npy file size does not match the manifest")
+                if not hmac.compare_digest(digest, manifest.vectors_sha256):
+                    raise ValueError("vectors.npy SHA-256 does not match the manifest")
+                handle.seek(0)
+                shape, order, dtype, offset = _read_bounded_npy_header(
+                    handle, max_header_bytes=limits.max_manifest_bytes, file_bytes=size,
+                )
+                if shape != (manifest.row_count, manifest.dimension):
+                    raise ValueError("vectors.npy shape does not match the manifest")
+                if order:
+                    raise ValueError("vectors.npy must use C order")
+                if dtype.str != manifest.dtype:
+                    raise ValueError("vectors.npy dtype does not match the manifest")
+                if offset + manifest.vector_payload_bytes != size:
+                    raise ValueError("vectors.npy data extent does not match the manifest")
+                for opened, path, initial in files:
+                    _assert_file_unchanged(opened, path, initial)
+
+                # Map the SAME open file descriptor that was hashed, using only
+                # validated dtype/shape/offset. No path reopen or header reread.
+                mapping = np.memmap(handle, dtype=dtype, mode="r", offset=offset, shape=shape,
+                                    order="C")
+                if mapping.shape != shape or mapping.dtype.str != manifest.dtype:
+                    raise ValueError("Mapped vectors do not match the validated header")
+                if mapping.flags.writeable or not mapping.flags.c_contiguous:
+                    raise ValueError("Mapped vectors must be read-only and C-contiguous")
+                if not _mapping_is_finite(mapping):
+                    raise ValueError("vectors.npy must contain only finite values")
+                for opened, path, initial in files:
+                    _assert_file_unchanged(opened, path, initial)
+            return cls(generation_dir=generation_dir, manifest=manifest,
+                       row_ids=metadata.row_ids, vectors=mapping)
+        except BaseException:
+            if mapping is not None:
+                with suppress(BaseException):
+                    _close_mapping(mapping)
+            raise
 
     @classmethod
     def _reuse_existing(
