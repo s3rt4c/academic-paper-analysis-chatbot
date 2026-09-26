@@ -14,9 +14,9 @@ from academic_chatbot.domain.library import Project
 from academic_chatbot.ports.documents import NativePdfAnchor, PdfAnchorBox
 from academic_chatbot.retrieval.fts import (
     RetrievalQueryError,
-    build_literal_match_expression,
     search_active_chunks,
 )
+from academic_chatbot.retrieval.query_plan import plan_natural_language_query
 from academic_chatbot.storage.paths import ProjectPaths
 
 
@@ -70,7 +70,7 @@ class RetrievalService:
     def search(self, project: Project, query: str, limit: int = 10) -> RetrievalResults:
         if type(limit) is not int or limit <= 0:
             raise RetrievalQueryError("limit must be a positive integer")
-        expression = build_literal_match_expression(query)
+        expression = plan_natural_language_query(query).expression
         paths = ProjectPaths.create(self._data_root, project_id=project.project_id)
         try:
             connection = open_read_only_connection(paths.database_path, data_root=self._data_root)

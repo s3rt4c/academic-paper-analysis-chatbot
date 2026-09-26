@@ -11,7 +11,10 @@ from academic_chatbot.documents.import_service import DocumentImportService
 from academic_chatbot.documents.native_pdf import NativePdfParser
 from academic_chatbot.domain.library import Project
 from academic_chatbot.library.service import LibraryService
-from academic_chatbot.retrieval.fts import RetrievalQueryError
+from academic_chatbot.retrieval.fts import (
+    RetrievalQueryError,
+    build_literal_match_expression,
+)
 from academic_chatbot.retrieval.service import (
     RetrievalIntegrityError,
     RetrievalService,
@@ -35,6 +38,24 @@ def _publish_fixture(
     parsed = NativePdfParser(paths).parse(file_version)
     published = DocumentImportService(library.repository_for(project)).publish(parsed)
     return library, project, paper, file_version, published
+
+
+def _publish_text_pdf(*, data_root: Path, text: str):
+    source = data_root.parent / "synthetic.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    pdf = canvas.Canvas(str(source), invariant=1)
+    pdf.drawString(36, 780, text)
+    pdf.save()
+    library = LibraryService(data_root=data_root, max_pdf_bytes=1_000_000)
+    project = library.create_project(display_name="Synthetic", project_id="project-1")
+    paper = library.create_paper(project_id=project.project_id, paper_id="paper-1")
+    file_version = library.admit_pdf(
+        project_id=project.project_id, paper_id=paper.paper_id, source_path=source
+    )
+    paths = ProjectPaths.create(data_root, project_id=project.project_id)
+    parsed = NativePdfParser(paths).parse(file_version)
+    published = DocumentImportService(library.repository_for(project)).publish(parsed)
+    return library, project, published
 
 
 def _persisted_rows(
@@ -266,13 +287,54 @@ def test_search_rejects_an_anchor_that_extends_past_the_chunk_range(tmp_path: Pa
         RetrievalService(data_root=data_root).search(project, "control")
 
 
-def test_search_maps_literal_fts_parser_rejection_to_query_error(tmp_path: Path) -> None:
-    """Would fail if a generated literal MATCH failure looked like storage corruption."""
+def test_search_rejects_unsupported_controls_before_opening_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Would fail if invalid lexical input opened the project database first."""
     data_root = tmp_path / "data"
     _, project, _, _, _ = _publish_fixture(data_root=data_root)
 
-    with pytest.raises(RetrievalQueryError, match="plain lexical query"):
+    def fail_open(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("invalid lexical input must not open storage")
+
+    monkeypatch.setattr("academic_chatbot.retrieval.service.open_read_only_connection", fail_open)
+
+    with pytest.raises(RetrievalQueryError, match="unsupported characters"):
         RetrievalService(data_root=data_root).search(project, "control\x00")
+
+
+def test_natural_language_query_acquires_synthetic_content_without_question_terms(
+    tmp_path: Path,
+) -> None:
+    """The planner must avoid mandatory co-occurrence of question/function words."""
+    data_root = tmp_path / "data"
+    library, project, published = _publish_text_pdf(
+        data_root=data_root,
+        text="The apparatus measures thermal conductivity.",
+    )
+    paths = ProjectPaths.create(data_root, project_id=project.project_id)
+    old_expression = build_literal_match_expression("Why does thermal conductivity change?")
+    with library.repository_for(project)._connection() as connection:
+        old_rows = connection.execute(
+            "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH ?", (old_expression,)
+        ).fetchall()
+    assert old_rows == []
+
+    first = RetrievalService(data_root=data_root).search(
+        project, "Why does thermal conductivity change?", limit=20
+    )
+    repeated = RetrievalService(data_root=data_root).search(
+        project, "Why does thermal conductivity change?", limit=20
+    )
+
+    assert first == repeated
+    assert first.query == "Why does thermal conductivity change?"
+    assert first.project_id == project.project_id
+    assert first.hits
+    assert first.hits[0].document_generation_id == published.document_generation_id
+    assert "thermal conductivity" in first.hits[0].chunk_text
+    assert all(hit.project_id == project.project_id for hit in first.hits)
+    assert paths.database_path.is_file()
 
 
 def test_needs_ocr_pages_remain_unsearchable(tmp_path: Path) -> None:

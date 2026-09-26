@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from reportlab.pdfgen import canvas
+
 from academic_chatbot.cli import main
 from academic_chatbot.db.connection import open_read_only_connection
 from academic_chatbot.documents import import_service
@@ -131,3 +133,59 @@ def test_python_module_entry_displays_cli_help() -> None:
 
     assert completed.returncode == 0
     assert "import-pdf" in completed.stdout
+
+
+def test_native_document_cli_journey_acquires_natural_language_lexical_match(
+    tmp_path: Path, capsys
+) -> None:
+    source = tmp_path / "thermal.pdf"
+    pdf = canvas.Canvas(str(source), invariant=1)
+    pdf.drawString(36, 780, "The apparatus measures thermal conductivity.")
+    pdf.save()
+
+    data_root = tmp_path / "data"
+    root = ["--data-root", str(data_root), "--max-pdf-bytes", "1000000"]
+    _invoke(
+        capsys,
+        [*root, "project", "create", "--project-id", "project-1", "--display-name", "Research"],
+    )
+    _invoke(
+        capsys,
+        [*root, "paper", "create", "--project-id", "project-1", "--paper-id", "paper-1"],
+    )
+    _invoke(
+        capsys,
+        [
+            *root,
+            "import-pdf",
+            "--project-id",
+            "project-1",
+            "--paper-id",
+            "paper-1",
+            "--source",
+            str(source),
+        ],
+    )
+
+    query = "Why does thermal conductivity change?"
+    result = _invoke(
+        capsys,
+        [
+            *root,
+            "search",
+            "--mode",
+            "lexical",
+            "--project-id",
+            "project-1",
+            "--query",
+            query,
+            "--limit",
+            "20",
+        ],
+    )
+
+    assert result["project_id"] == "project-1"
+    assert result["query"] == query
+    hits = result["hits"]
+    assert isinstance(hits, list) and hits
+    assert "thermal conductivity" in hits[0]["chunk_text"]

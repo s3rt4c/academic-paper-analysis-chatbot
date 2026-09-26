@@ -77,7 +77,7 @@ def test_cli_returns_clean_error_for_nonlexical_search(tmp_path: Path, capsys) -
         == 2
     )
     captured = capsys.readouterr()
-    assert "meaningful lexical" in captured.err
+    assert "no searchable terms" in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -643,6 +643,43 @@ def test_cli_lexical_modes_do_not_initialize_hybrid_runtime(
         "hits": [],
         "project_id": "p",
         "query": "lexical query",
+    }
+
+
+def test_cli_forwards_an_ordinary_natural_language_query_unchanged(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    query = "Why does thermal conductivity change?"
+
+    class _LexicalService:
+        def __init__(self, *, data_root: Path) -> None:
+            assert data_root == tmp_path / "data"
+
+        def search(self, project: object, query: str, limit: int) -> RetrievalResults:
+            assert query == "Why does thermal conductivity change?"
+            assert limit == 20
+            return RetrievalResults(project_id="p", query=query, hits=())
+
+    monkeypatch.setattr("academic_chatbot.cli.RetrievalService", _LexicalService)
+    arguments = [
+        "--data-root",
+        str(tmp_path / "data"),
+        "--max-pdf-bytes",
+        "1000000",
+        "search",
+        "--project-id",
+        "p",
+        "--query",
+        query,
+        "--limit",
+        "20",
+    ]
+
+    assert main(arguments) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "hits": [],
+        "project_id": "p",
+        "query": query,
     }
 
 

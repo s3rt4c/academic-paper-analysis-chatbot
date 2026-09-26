@@ -23,7 +23,7 @@ from tests.integration.retrieval.test_project_semantic_search import (
 def test_hybrid_search_resolves_one_current_parent_with_separate_channel_evidence(
     tmp_path,
 ) -> None:
-    semantic, _, repository, _ = _active_service(tmp_path)
+    semantic, query_embedder, repository, _ = _active_service(tmp_path)
     paths = repository._paths  # type: ignore[attr-defined]
     connection = connect_project_database(paths.database_path, data_root=paths.data_root)
     try:
@@ -36,7 +36,8 @@ def test_hybrid_search_resolves_one_current_parent_with_separate_channel_evidenc
         semantic_service=semantic,
     )
 
-    results = service.search(_project_value(), "alpha", limit=10)
+    query = "Why does alpha change?"
+    results = service.search(_project_value(), query, limit=10)
 
     assert len(results.hits) == 1
     hit = results.hits[0]
@@ -46,6 +47,8 @@ def test_hybrid_search_resolves_one_current_parent_with_separate_channel_evidenc
     assert hit.semantic_contribution is not None
     assert hit.lexical_contribution.lexical_hit.chunk_text == "alpha beta gamma"
     assert hit.semantic_contribution.semantic_hit.embedding_span_text == "alpha beta gamma"
+    assert query_embedder.calls == [(query,)]
+    assert results.query == query
 
 
 def test_hybrid_search_keeps_semantic_only_evidence_when_lexical_is_healthy_empty(tmp_path) -> None:
