@@ -4,7 +4,7 @@ import hashlib
 import json
 import socket
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +18,10 @@ from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profil
 from academic_chatbot.embeddings.repository import EmbeddingRepository
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.retrieval.semantic import SemanticRetrievalService
+from academic_chatbot.retrieval.semantic_query import (
+    CANONICAL_CONCERN_TEXT,
+    SemanticQuerySelection,
+)
 from academic_chatbot.storage.paths import ProjectPaths
 from tests.integration.embeddings.test_vector_publication import _builder, _Embedder, _profile
 
@@ -28,8 +32,10 @@ _PDF = Path(__file__).parents[1] / "fixtures" / "pdfs" / "native_anchor.pdf"
 class _QueryEmbedder:
     profile: object
     vector: np.ndarray
+    calls: list[tuple[str, ...]] = field(default_factory=list)
 
     def embed_queries(self, texts: tuple[str, ...]) -> np.ndarray:
+        self.calls.append(texts)
         return self.vector[np.newaxis, :].astype(np.float32, copy=True)
 
 
@@ -50,16 +56,30 @@ def test_native_pdf_to_semantic_hit_preserves_active_evidence(tmp_path: Path) ->
     document_embedder = _Embedder(profile)
     built = _builder(repository, paths, document_embedder).build(project_id=project.project_id)
     query_vector = document_embedder.embed_documents((document_embedder.calls[0][0],))[0]
-    results = SemanticRetrievalService(
+    query_embedder = _QueryEmbedder(profile, query_vector)
+    service = SemanticRetrievalService(
         data_root=data_root,
         profile=profile,
-        embedder=_QueryEmbedder(profile, query_vector),
-    ).search(Project(project_id=project.project_id, display_name="Native"), "semantic native")
+        embedder=query_embedder,
+    )
+    project_value = Project(project_id=project.project_id, display_name="Native")
+    results = service.search(project_value, "semantic native")
+    concern_results = service.search(
+        project_value,
+        "a different user question",
+        query_selection=SemanticQuerySelection(
+            mode="concern", concern_id="stated-study-objective-v1"
+        ),
+    )
 
     assert built.generation.vector_generation_id == results.hits[0].vector_generation_id
     assert results.hits[0].file_version_id == file_version.file_version_id
     assert results.hits[0].paper_id == "paper-one"
     assert results.hits[0].anchors
+    assert concern_results.query == "a different user question"
+    assert concern_results.hits[0].vector_generation_id == built.generation.vector_generation_id
+    assert concern_results.hits[0].file_version_id == file_version.file_version_id
+    assert query_embedder.calls == [("semantic native",), (CANONICAL_CONCERN_TEXT,)]
 
 
 @dataclass(frozen=True)

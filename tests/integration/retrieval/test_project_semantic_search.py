@@ -16,9 +16,14 @@ from academic_chatbot.retrieval.semantic import (
     SemanticArtifactIntegrityError,
     SemanticIndexStaleError,
     SemanticIndexUnavailableError,
+    SemanticQueryError,
     SemanticQueryTooLongError,
     SemanticRetrievalIntegrityError,
     SemanticRetrievalService,
+)
+from academic_chatbot.retrieval.semantic_query import (
+    CANONICAL_CONCERN_TEXT,
+    SemanticQuerySelection,
 )
 from tests.integration.embeddings.test_vector_publication import (
     _builder,
@@ -177,6 +182,39 @@ def test_search_returns_current_exact_evidence_and_raw_cosine(tmp_path: Path) ->
     assert (hit.start_offset, hit.end_offset) == (0, 16)
     assert hit.chunk_id == "chunk-one"
     assert [anchor.anchor_text for anchor in hit.anchors] == ["alpha", "beta", "gamma"]
+
+
+def test_concern_selection_embeds_exact_canonical_text_and_preserves_user_query(
+    tmp_path: Path,
+) -> None:
+    service, query_embedder, _, _ = _active_service(tmp_path)
+    user_query = "Which finding is reported?"
+
+    results = service.search(
+        _project_value(),
+        user_query,
+        limit=1,
+        query_selection=SemanticQuerySelection(
+            mode="concern", concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert query_embedder.calls == [(CANONICAL_CONCERN_TEXT,)]
+    assert results.query == user_query
+    assert len(results.hits) == 1
+
+
+def test_invalid_concern_selection_fails_before_embedding(tmp_path: Path) -> None:
+    service, query_embedder, _, _ = _active_service(tmp_path)
+
+    with pytest.raises(SemanticQueryError):
+        service.search(
+            _project_value(),
+            "Which finding is reported?",
+            query_selection=SemanticQuerySelection(mode="concern"),
+        )
+
+    assert query_embedder.calls == []
 
 
 def test_search_returns_empty_for_a_valid_empty_generation(tmp_path: Path) -> None:

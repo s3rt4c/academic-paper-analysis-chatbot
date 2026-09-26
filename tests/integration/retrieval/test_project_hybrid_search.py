@@ -13,6 +13,10 @@ from academic_chatbot.retrieval.hybrid_service import (
     HybridRetrievalService,
     _ParentChunkEvidenceResolver,
 )
+from academic_chatbot.retrieval.semantic_query import (
+    CANONICAL_CONCERN_TEXT,
+    SemanticQuerySelection,
+)
 from academic_chatbot.retrieval.service import RetrievalService
 from tests.integration.retrieval.test_project_semantic_search import (
     _active_service,
@@ -49,6 +53,35 @@ def test_hybrid_search_resolves_one_current_parent_with_separate_channel_evidenc
     assert hit.semantic_contribution.semantic_hit.embedding_span_text == "alpha beta gamma"
     assert query_embedder.calls == [(query,)]
     assert results.query == query
+
+
+def test_hybrid_concern_selection_uses_one_semantic_channel_and_preserves_query(
+    tmp_path,
+) -> None:
+    semantic, query_embedder, repository, _ = _active_service(tmp_path)
+    paths = repository._paths  # type: ignore[attr-defined]
+    connection = connect_project_database(paths.database_path, data_root=paths.data_root)
+    try:
+        connection.execute("INSERT INTO chunk_fts VALUES ('chunk-one', 'alpha beta gamma')")
+    finally:
+        connection.close()
+    service = HybridRetrievalService(
+        data_root=paths.data_root,
+        lexical_service=RetrievalService(data_root=paths.data_root),
+        semantic_service=semantic,
+    )
+    query = "Why does alpha change?"
+    selection = SemanticQuerySelection(
+        mode="concern", concern_id="stated-study-objective-v1"
+    )
+
+    results = service.search(
+        _project_value(), query, limit=10, query_selection=selection
+    )
+
+    assert query_embedder.calls == [(CANONICAL_CONCERN_TEXT,)]
+    assert results.query == query
+    assert len(results.hits) == 1
 
 
 def test_hybrid_search_keeps_semantic_only_evidence_when_lexical_is_healthy_empty(tmp_path) -> None:

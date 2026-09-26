@@ -27,6 +27,7 @@ from academic_chatbot.retrieval.semantic import (
     _current_snapshot,
     _generation_sources,
 )
+from academic_chatbot.retrieval.semantic_query import SemanticQuerySelection
 from academic_chatbot.retrieval.service import (
     RetrievalHit,
     RetrievalResults,
@@ -46,7 +47,14 @@ class _LexicalSearch(Protocol):
 
 
 class _SemanticSearch(Protocol):
-    def search(self, project: Project, query: str, limit: int) -> SemanticRetrievalResults: ...
+    def search(
+        self,
+        project: Project,
+        query: str,
+        limit: int,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+    ) -> SemanticRetrievalResults: ...
 
 
 class _ParentResolver(Protocol):
@@ -87,12 +95,24 @@ class HybridRetrievalService:
             ),
         )
 
-    def search(self, project: Project, query: str, limit: int = 10) -> HybridRetrievalResults:
+    def search(
+        self,
+        project: Project,
+        query: str,
+        limit: int = 10,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+    ) -> HybridRetrievalResults:
         """Search both accepted channels and resolve exact current parent evidence."""
 
         depth = candidate_limit(limit)
         lexical = self._lexical.search(project, query, limit=depth)
-        semantic = self._semantic.search(project, query, limit=depth)
+        if query_selection is None:
+            semantic = self._semantic.search(project, query, limit=depth)
+        else:
+            semantic = self._semantic.search(
+                project, query, limit=depth, query_selection=query_selection
+            )
         _validate_channel_results(project, query, lexical, semantic)
         fused = fuse_candidates(lexical.hits, semantic.hits, final_limit=limit)
         hits = tuple(

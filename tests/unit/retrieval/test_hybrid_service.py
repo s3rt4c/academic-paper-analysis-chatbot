@@ -16,6 +16,7 @@ from academic_chatbot.retrieval.semantic import (
     SemanticRetrievalHit,
     SemanticRetrievalResults,
 )
+from academic_chatbot.retrieval.semantic_query import SemanticQuerySelection
 from academic_chatbot.retrieval.service import RetrievalHit, RetrievalResults, RetrievalStorageError
 
 
@@ -104,10 +105,19 @@ class _LexicalService:
 class _SemanticService:
     hits: tuple[SemanticRetrievalHit, ...] = ()
     error: Exception | None = None
-    calls: list[tuple[Project, str, int]] = field(default_factory=list)
+    calls: list[tuple[Project, str, int, SemanticQuerySelection | None]] = field(
+        default_factory=list
+    )
 
-    def search(self, project: Project, query: str, limit: int) -> SemanticRetrievalResults:
-        self.calls.append((project, query, limit))
+    def search(
+        self,
+        project: Project,
+        query: str,
+        limit: int,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+    ) -> SemanticRetrievalResults:
+        self.calls.append((project, query, limit, query_selection))
         if self.error is not None:
             raise self.error
         return SemanticRetrievalResults(
@@ -151,9 +161,29 @@ def test_search_passes_the_original_query_and_frozen_depth_to_both_channels() ->
     result = _service(lexical, semantic, resolver).search(_project(), "original query", limit=11)
 
     assert lexical.calls == [(_project(), "original query", 55)]
-    assert semantic.calls == [(_project(), "original query", 55)]
+    assert semantic.calls == [(_project(), "original query", 55, None)]
     assert len(result.hits) == 1
     assert result.hits[0].trace.fusion_rank == 1
+
+
+def test_search_forwards_one_explicit_selection_only_to_semantic() -> None:
+    lexical, semantic, resolver = (
+        _LexicalService(hits=(_lexical(),)),
+        _SemanticService(hits=(_semantic(),)),
+        _Resolver(),
+    )
+    selection = SemanticQuerySelection(
+        mode="concern", concern_id="stated-study-objective-v1"
+    )
+
+    result = _service(lexical, semantic, resolver).search(
+        _project(), "original query", limit=11, query_selection=selection
+    )
+
+    assert lexical.calls == [(_project(), "original query", 55)]
+    assert semantic.calls == [(_project(), "original query", 55, selection)]
+    assert result.query == "original query"
+    assert len(result.hits) == 1
 
 
 def test_healthy_empty_channels_are_successful_and_stateful() -> None:

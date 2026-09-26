@@ -28,6 +28,11 @@ from academic_chatbot.embeddings.tokenizer import EmbeddingInputError, Embedding
 from academic_chatbot.embeddings.vector_build import _profile_sha256, _verify_empty_artifact
 from academic_chatbot.ports.documents import NativePdfAnchor
 from academic_chatbot.retrieval.exact_memmap import ExactVectorStore, VectorHit
+from academic_chatbot.retrieval.semantic_query import (
+    SemanticQueryPolicyError,
+    SemanticQuerySelection,
+    resolve_semantic_query,
+)
 from academic_chatbot.retrieval.service import _required_text, anchor_from_row
 from academic_chatbot.storage.paths import PathEscapeError, ProjectPaths
 
@@ -163,11 +168,22 @@ class SemanticRetrievalService:
             ) from error
         return cls(data_root=data_root, profile=profile, embedder=embedder)
 
-    def search(self, project: Project, query: str, limit: int = 10) -> SemanticRetrievalResults:
+    def search(
+        self,
+        project: Project,
+        query: str,
+        limit: int = 10,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+    ) -> SemanticRetrievalResults:
         if type(limit) is not int or limit <= 0:
             raise SemanticQueryError("limit must be a positive integer")
         if not isinstance(query, str) or not query.strip():
             raise SemanticQueryError("semantic query must not be empty or whitespace-only")
+        try:
+            representation = resolve_semantic_query(query, query_selection)
+        except SemanticQueryPolicyError as error:
+            raise SemanticQueryError("semantic query selection is invalid") from error
         paths = ProjectPaths.create(self._data_root, project_id=project.project_id)
         try:
             connection = open_read_only_connection(paths.database_path, data_root=self._data_root)
@@ -195,6 +211,7 @@ class SemanticRetrievalService:
                 generation=generation,
                 project=project,
                 query=query,
+                query_representation=representation.text,
                 limit=limit,
             )
         except sqlite3.DatabaseError as error:
@@ -213,6 +230,7 @@ class SemanticRetrievalService:
         generation: _Generation,
         project: Project,
         query: str,
+        query_representation: str,
         limit: int,
     ) -> SemanticRetrievalResults:
         artifact = _artifact_path(
@@ -274,7 +292,7 @@ class SemanticRetrievalService:
                 raise SemanticArtifactIntegrityError(
                     "published vector artifact does not match its metadata"
                 )
-            query_vector = self._embed_query(query)
+            query_vector = self._embed_query(query_representation)
             try:
                 vector_hits = store.search(query_vector, limit=limit, block_rows=4096)
             except (TypeError, ValueError) as error:
