@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from academic_chatbot.cli import main
+from academic_chatbot.cli import _parser, main
 from academic_chatbot.domain.library import Project
 from academic_chatbot.embeddings.artifacts import EmbeddingArtifactError
 from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profile
@@ -56,6 +57,48 @@ def test_cli_returns_clean_error_for_argument_errors(capsys) -> None:
     captured = capsys.readouterr()
     assert "usage:" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_cli_group_preview_has_exact_explicit_parser_route(tmp_path: Path) -> None:
+    parser = _parser(preview_errors=True)
+    arguments = parser.parse_args(
+        [
+            "--data-root",
+            str(tmp_path / "data"),
+            "--max-pdf-bytes",
+            "1000000",
+            "evidence-group",
+            "preview",
+            "--request-stdin",
+        ]
+    )
+    assert arguments.command == "evidence-group"
+    assert arguments.evidence_group_command == "preview"
+    assert arguments.request_stdin is True
+
+
+def test_cli_group_preview_invalid_json_uses_safe_binary_error(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    stdin = type("Input", (), {"buffer": io.BytesIO(b"{}")})()
+    monkeypatch.setattr("academic_chatbot.cli.sys.stdin", stdin)
+    code = main(
+        [
+            "--data-root",
+            str(tmp_path / "data"),
+            "--max-pdf-bytes",
+            "1000000",
+            "evidence-group",
+            "preview",
+            "--request-stdin",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["code"] == "INVALID_REQUEST"
+    assert "{}" not in captured.err
 
 
 def test_cli_returns_clean_error_for_nonlexical_search(tmp_path: Path, capsys) -> None:

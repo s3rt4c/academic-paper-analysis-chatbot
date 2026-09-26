@@ -20,6 +20,8 @@ from academic_chatbot.embeddings.models import canonical_json_bytes
 from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profile
 from academic_chatbot.embeddings.repository import EmbeddingPersistenceError, EmbeddingRepository
 from academic_chatbot.embeddings.vector_build import ProjectVectorBuilder, VectorBuildError
+from academic_chatbot.evidence import groups as evidence_groups
+from academic_chatbot.evidence.group_service import EvidenceGroupService
 from academic_chatbot.evidence.models import EvidenceBundleError, EvidenceErrorCode, PreviewState
 from academic_chatbot.evidence.resolver import EvidenceReadResolver, EvidenceResolutionError
 from academic_chatbot.evidence.serialization import (
@@ -71,6 +73,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return error.code if isinstance(error.code, int) else 2
     if arguments.command == "evidence-bundle":
         return _dispatch_evidence_preview(arguments)
+    if arguments.command == "evidence-group":
+        return _dispatch_evidence_group_preview(arguments)
     try:
         if arguments.max_pdf_bytes <= 0:
             raise ValueError("--max-pdf-bytes must be positive")
@@ -119,7 +123,7 @@ def _is_evidence_invocation(tokens: Sequence[str]) -> bool:
         namespace, _ = probe.parse_known_args(tokens)
     except EvidencePreparationError:
         return False
-    return bool(namespace.command == "evidence-bundle")
+    return bool(namespace.command in {"evidence-bundle", "evidence-group"})
 
 
 def _write_evidence_error(error: EvidenceBundleError) -> int:
@@ -153,6 +157,56 @@ def _dispatch_evidence_preview(arguments: argparse.Namespace) -> int:
     return 3 if bundle.state is PreviewState.INSUFFICIENT_EVIDENCE else 0
 
 
+def _write_evidence_group_error(error: evidence_groups.EvidenceGroupError) -> int:
+    sys.stderr.buffer.write(
+        canonical_evidence_json(error.model_dump(mode="json")) + b"\n"
+    )
+    sys.stderr.buffer.flush()
+    return 2
+
+
+def _dispatch_evidence_group_preview(arguments: argparse.Namespace) -> int:
+    try:
+        if arguments.max_pdf_bytes <= 0:
+            raise evidence_groups.EvidenceGroupPreparationError(
+                evidence_groups.EvidenceGroupError(
+                    code=evidence_groups.EvidenceGroupErrorCode.INVALID_REQUEST
+                )
+            )
+        request = evidence_groups.parse_evidence_group_request(
+            read_request_bytes(sys.stdin.buffer)
+        )
+        service = EvidenceGroupService(
+            resolver=EvidenceReadResolver(data_root=Path(arguments.data_root))
+        )
+        bundle = service.build(request)
+        output = evidence_groups.canonical_evidence_group_bytes(bundle) + b"\n"
+    except evidence_groups.EvidenceGroupPreparationError as error:
+        return _write_evidence_group_error(error.error)
+    except EvidencePreparationError as error:
+        code = (
+            evidence_groups.EvidenceGroupErrorCode.RESOURCE_LIMIT
+            if error.error.code == EvidenceErrorCode.RESOURCE_LIMIT
+            else evidence_groups.EvidenceGroupErrorCode.INVALID_REQUEST
+        )
+        return _write_evidence_group_error(evidence_groups.EvidenceGroupError(code=code))
+    except OSError:
+        return _write_evidence_group_error(
+            evidence_groups.EvidenceGroupError(
+                code=evidence_groups.EvidenceGroupErrorCode.GROUP_MEMBER_RESOLUTION_FAILED
+            )
+        )
+    except Exception:
+        return _write_evidence_group_error(
+            evidence_groups.EvidenceGroupError(
+                code=evidence_groups.EvidenceGroupErrorCode.GROUP_PACKING_FAILED
+            )
+        )
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.flush()
+    return 3 if bundle.state is PreviewState.INSUFFICIENT_EVIDENCE else 0
+
+
 def _parser(*, preview_errors: bool = False) -> argparse.ArgumentParser:
     parser_type = _EvidenceArgumentParser if preview_errors else argparse.ArgumentParser
     parser = parser_type(prog="academic_chatbot")
@@ -164,6 +218,11 @@ def _parser(*, preview_errors: bool = False) -> argparse.ArgumentParser:
     )
     preview = evidence.add_parser("preview")
     preview.add_argument("--request-stdin", action="store_true", required=True)
+    evidence_group = commands.add_parser("evidence-group").add_subparsers(
+        dest="evidence_group_command", required=True
+    )
+    group_preview = evidence_group.add_parser("preview")
+    group_preview.add_argument("--request-stdin", action="store_true", required=True)
     project = commands.add_parser("project").add_subparsers(dest="project_command", required=True)
     create_project = project.add_parser("create")
     create_project.add_argument("--project-id", required=True)
