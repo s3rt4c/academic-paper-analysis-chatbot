@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from academic_chatbot.db.connection import DatabasePathError, open_read_only_connection
 from academic_chatbot.domain.library import Project
@@ -26,6 +26,10 @@ from academic_chatbot.retrieval.semantic import (
     SemanticRetrievalService,
     _current_snapshot,
     _generation_sources,
+)
+from academic_chatbot.retrieval.semantic_position import (
+    PositionalAcquisitionSelection,
+    SemanticPositionalAcquisition,
 )
 from academic_chatbot.retrieval.semantic_query import SemanticQuerySelection
 from academic_chatbot.retrieval.service import (
@@ -55,6 +59,18 @@ class _SemanticSearch(Protocol):
         *,
         query_selection: SemanticQuerySelection | None = None,
     ) -> SemanticRetrievalResults: ...
+
+
+class _PositionalSemanticSearch(Protocol):
+    def acquire_positional(
+        self,
+        project: Project,
+        query: str,
+        limit: int,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+        positional_selection: PositionalAcquisitionSelection,
+    ) -> SemanticPositionalAcquisition: ...
 
 
 class _ParentResolver(Protocol):
@@ -102,17 +118,43 @@ class HybridRetrievalService:
         limit: int = 10,
         *,
         query_selection: SemanticQuerySelection | None = None,
+        positional_selection: PositionalAcquisitionSelection | None = None,
     ) -> HybridRetrievalResults:
         """Search both accepted channels and resolve exact current parent evidence."""
 
         depth = candidate_limit(limit)
         lexical = self._lexical.search(project, query, limit=depth)
-        if query_selection is None:
+        if positional_selection is None and query_selection is None:
             semantic = self._semantic.search(project, query, limit=depth)
-        else:
+        elif positional_selection is None:
             semantic = self._semantic.search(
                 project, query, limit=depth, query_selection=query_selection
             )
+        else:
+            acquire_positional = getattr(self._semantic, "acquire_positional", None)
+            if not callable(acquire_positional):
+                raise HybridRetrievalIntegrityError(
+                    "positional semantic acquisition is unavailable"
+                )
+            try:
+                acquisition = cast(_PositionalSemanticSearch, self._semantic).acquire_positional(
+                    project,
+                    query,
+                    limit=limit,
+                    query_selection=query_selection,
+                    positional_selection=positional_selection,
+                )
+                semantic = SemanticRetrievalResults(
+                    project_id=acquisition.project_id,
+                    query=acquisition.query,
+                    embedding_profile_id=acquisition.embedding_profile_id,
+                    vector_generation_id=acquisition.vector_generation_id,
+                    hits=acquisition.ordered_hits,
+                )
+            except (AttributeError, TypeError, ValueError) as error:
+                raise HybridRetrievalIntegrityError(
+                    "positional semantic acquisition is invalid"
+                ) from error
         _validate_channel_results(project, query, lexical, semantic)
         fused = fuse_candidates(lexical.hits, semantic.hits, final_limit=limit)
         hits = tuple(

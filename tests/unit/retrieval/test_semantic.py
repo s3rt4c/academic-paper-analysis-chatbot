@@ -6,13 +6,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from academic_chatbot.domain.library import Project
 from academic_chatbot.retrieval.semantic import (
     SemanticArtifactIntegrityError,
+    SemanticQueryError,
     SemanticRetrievalService,
     _artifact_path,
     _load_registered_profile_with_manifest_hash,
     _require_ordinary_artifact_files,
 )
+from academic_chatbot.retrieval.semantic_position import PositionalAcquisitionSelection
 from academic_chatbot.retrieval.semantic_query import CANONICAL_CONCERN_TEXT
 from academic_chatbot.storage.paths import ProjectPaths
 from tests.integration.embeddings.test_vector_publication import _profile, _project
@@ -41,6 +44,25 @@ def test_query_embedding_receives_one_exact_selected_representation() -> None:
 
     assert vector.shape == (profile.dimension,)
     assert embedder.calls == [(CANONICAL_CONCERN_TEXT,)]
+
+
+def test_positional_acquisition_rejects_unknown_concern_before_embedding() -> None:
+    profile = _profile()
+    embedder = _RecordingQueryEmbedder(profile)
+    service = SemanticRetrievalService(
+        data_root=Path("unused"), profile=profile, embedder=embedder
+    )
+
+    with pytest.raises(SemanticQueryError):
+        service.acquire_positional(
+            Project(project_id="project-one", display_name="Research"),
+            "user query",
+            positional_selection=PositionalAcquisitionSelection(
+                concern_id="unsupported-concern-v1"
+            ),
+        )
+
+    assert embedder.calls == []
 
 
 def test_semantic_artifact_path_rejects_nonsemantic_project_locations(tmp_path: Path) -> None:

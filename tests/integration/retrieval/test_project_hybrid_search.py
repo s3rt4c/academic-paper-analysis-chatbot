@@ -13,6 +13,7 @@ from academic_chatbot.retrieval.hybrid_service import (
     HybridRetrievalService,
     _ParentChunkEvidenceResolver,
 )
+from academic_chatbot.retrieval.semantic_position import PositionalAcquisitionSelection
 from academic_chatbot.retrieval.semantic_query import (
     CANONICAL_CONCERN_TEXT,
     SemanticQuerySelection,
@@ -77,6 +78,68 @@ def test_hybrid_concern_selection_uses_one_semantic_channel_and_preserves_query(
 
     results = service.search(
         _project_value(), query, limit=10, query_selection=selection
+    )
+
+    assert query_embedder.calls == [(CANONICAL_CONCERN_TEXT,)]
+    assert results.query == query
+    assert len(results.hits) == 1
+
+
+def test_hybrid_positional_generic_query_is_explicit_and_single_call(tmp_path) -> None:
+    semantic, query_embedder, repository, _ = _active_service(tmp_path)
+    paths = repository._paths  # type: ignore[attr-defined]
+    connection = connect_project_database(paths.database_path, data_root=paths.data_root)
+    try:
+        connection.execute("INSERT INTO chunk_fts VALUES ('chunk-one', 'alpha beta gamma')")
+    finally:
+        connection.close()
+    service = HybridRetrievalService(
+        data_root=paths.data_root,
+        lexical_service=RetrievalService(data_root=paths.data_root),
+        semantic_service=semantic,
+    )
+    query = "Why does alpha change?"
+
+    results = service.search(
+        _project_value(),
+        query,
+        limit=10,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert query_embedder.calls == [(query,)]
+    assert results.query == query
+    assert results.fusion_profile_id == "rrf-v1"
+    assert len(results.hits) == 1
+
+
+def test_hybrid_positional_concern_query_preserves_original_request(tmp_path) -> None:
+    semantic, query_embedder, repository, _ = _active_service(tmp_path)
+    paths = repository._paths  # type: ignore[attr-defined]
+    connection = connect_project_database(paths.database_path, data_root=paths.data_root)
+    try:
+        connection.execute("INSERT INTO chunk_fts VALUES ('chunk-one', 'alpha beta gamma')")
+    finally:
+        connection.close()
+    service = HybridRetrievalService(
+        data_root=paths.data_root,
+        lexical_service=RetrievalService(data_root=paths.data_root),
+        semantic_service=semantic,
+    )
+    query = "Why does alpha change?"
+
+    results = service.search(
+        _project_value(),
+        query,
+        limit=10,
+        query_selection=SemanticQuerySelection(
+            mode="concern", concern_id="stated-study-objective-v1"
+        ),
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
     )
 
     assert query_embedder.calls == [(CANONICAL_CONCERN_TEXT,)]
