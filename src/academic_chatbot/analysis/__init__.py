@@ -10,8 +10,22 @@ from academic_chatbot.analysis.models import (
     SupportedProposal,
     UnreadableProposal,
 )
+from academic_chatbot.analysis.supported_objective_verifier import (
+    SUPPORTED_OBJECTIVE_VERIFIER_POLICY_ID,
+    SupportedObjectiveAbstained,
+    SupportedObjectiveAbstentionReason,
+    SupportedObjectiveCitationVerifier,
+    SupportedObjectiveFailed,
+    SupportedObjectiveFailureCode,
+    SupportedObjectiveRejected,
+    SupportedObjectiveRejectionCode,
+    SupportedObjectiveVerificationRequest,
+    SupportedObjectiveVerificationResult,
+    SupportedObjectiveVerified,
+)
 
 __all__ = [
+    "SUPPORTED_OBJECTIVE_VERIFIER_POLICY_ID",
     "AnalysisEvidenceUnit",
     "ConflictingProposal",
     "CoverageBlocker",
@@ -20,6 +34,16 @@ __all__ = [
     "NotReportedProposal",
     "ObjectiveStatusProposal",
     "StandaloneAnalysisEvidenceUnit",
+    "SupportedObjectiveAbstained",
+    "SupportedObjectiveAbstentionReason",
+    "SupportedObjectiveCitationVerifier",
+    "SupportedObjectiveFailed",
+    "SupportedObjectiveFailureCode",
+    "SupportedObjectiveRejected",
+    "SupportedObjectiveRejectionCode",
+    "SupportedObjectiveVerificationRequest",
+    "SupportedObjectiveVerificationResult",
+    "SupportedObjectiveVerified",
     "SupportedProposal",
     "UnreadableProposal",
 ]
