@@ -7,6 +7,7 @@ from pathlib import Path
 
 from academic_chatbot.documents.import_service import DocumentImportService
 from academic_chatbot.documents.native_pdf import NativePdfParser
+from academic_chatbot.domain.library import Project
 from academic_chatbot.embeddings.repository import EmbeddingRepository
 from academic_chatbot.evidence.models import (
     BundleSourceScope,
@@ -17,8 +18,16 @@ from academic_chatbot.evidence.models import (
     PreviewBudget,
     SemanticRangeRef,
 )
+from academic_chatbot.evidence.references import (
+    candidate_ref_from_hybrid,
+    candidate_ref_from_lexical,
+    candidate_ref_from_semantic,
+)
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.retrieval.hybrid_models import ChunkCandidateIdentity
+from academic_chatbot.retrieval.hybrid_service import HybridRetrievalService
+from academic_chatbot.retrieval.semantic import SemanticRetrievalService
+from academic_chatbot.retrieval.service import RetrievalService
 from academic_chatbot.storage.paths import ProjectPaths
 from tests.fixtures.evidence_bundle.pdfs import write_pdf
 from tests.integration.embeddings.test_vector_publication import _builder, _Embedder, _profile
@@ -63,6 +72,56 @@ class Database:
                 (tuple(r) for r in self.rows(f'SELECT * FROM "{name}"')), key=repr
             )
         return result
+
+    def retrieved(self, *, mode="lexical", maximum_words=510, query="Alpha"):
+        """Run actual retrieval and pure reference conversion after synthetic setup."""
+        project = Project(project_id=self.request.scope.project_id, display_name="Synthetic")
+        if mode == "lexical":
+            hits = RetrievalService(data_root=self.paths.data_root).search(project, query).hits
+            origin = CandidateOrigin(mode="lexical")
+            candidates = tuple(candidate_ref_from_lexical(hit) for hit in hits)
+        else:
+            prepared = self.semantic(maximum_words=maximum_words)
+            profile = _profile()
+            semantic = SemanticRetrievalService(
+                data_root=self.paths.data_root,
+                profile=profile,
+                embedder=_SyntheticQueryEmbedder(profile),
+            )
+            if mode == "semantic":
+                hits = semantic.search(project, query, limit=100).hits
+                candidates = tuple(candidate_ref_from_semantic(hit) for hit in hits)
+                origin = prepared.origin
+            elif mode == "hybrid":
+                hits = (
+                    HybridRetrievalService(
+                        data_root=self.paths.data_root,
+                        semantic_service=semantic,
+                    )
+                    .search(project, query, limit=100)
+                    .hits
+                )
+                candidates = tuple(candidate_ref_from_hybrid(hit) for hit in hits)
+                origin = CandidateOrigin(
+                    mode="hybrid",
+                    fusion_profile_id="rrf-v1",
+                    embedding_profile_id=prepared.origin.embedding_profile_id,
+                    vector_generation_id=prepared.origin.vector_generation_id,
+                )
+            else:
+                raise ValueError("unsupported synthetic retrieval mode")
+        # Select only the explicitly requested generation; older versions remain current.
+        candidates = tuple(
+            c
+            for c in candidates
+            if c.parent.document_generation_id == self.request.scope.document_generation_id
+        )
+        return EvidenceBundleRequest(
+            scope=self.request.scope,
+            origin=origin,
+            candidates=candidates,
+            preview_budget=PreviewBudget(),
+        )
 
     def semantic(self, *, maximum_words: int = 510) -> EvidenceBundleRequest:
         profile = _profile()
@@ -116,22 +175,34 @@ class Database:
         )
 
 
-def database(tmp_path: Path, *, empty: bool = False, older: bool = False) -> Database:
+class _SyntheticQueryEmbedder(_Embedder):
+    """Reuse deterministic document vectors for query-time fixture setup only."""
+
+    def embed_queries(self, texts):
+        return self.embed_documents(texts)
+
+
+def database(
+    tmp_path: Path,
+    *,
+    empty: bool = False,
+    older: bool = False,
+    text: str | None = None,
+    project_id: str = "project-one",
+) -> Database:
     service = LibraryService(data_root=tmp_path / "data", max_pdf_bytes=1_000_000)
-    service.create_project(display_name="Synthetic", project_id="project-one")
-    service.create_paper(project_id="project-one", paper_id="paper-one")
-    paths = ProjectPaths.create(tmp_path / "data", project_id="project-one")
+    service.create_project(display_name="Synthetic", project_id=project_id)
+    service.create_paper(project_id=project_id, paper_id="paper-one")
+    paths = ProjectPaths.create(tmp_path / "data", project_id=project_id)
     version = service.admit_pdf(
-        project_id="project-one",
+        project_id=project_id,
         paper_id="paper-one",
-        source_path=write_pdf(tmp_path / "source.pdf", empty=empty),
+        source_path=write_pdf(tmp_path / "source.pdf", empty=empty, text=text),
     )
     parsed = NativePdfParser(paths).parse(version)
-    published = DocumentImportService(service.repository_for_project_id("project-one")).publish(
-        parsed
-    )
+    published = DocumentImportService(service.repository_for_project_id(project_id)).publish(parsed)
     scope = BundleSourceScope(
-        project_id="project-one",
+        project_id=project_id,
         paper_id="paper-one",
         file_version_id=version.file_version_id,
         document_generation_id=published.document_generation_id,
@@ -172,11 +243,11 @@ def database(tmp_path: Path, *, empty: bool = False, older: bool = False) -> Dat
     db.request = db.request.model_copy(update={"candidates": tuple(candidates)})
     if older:
         newer = service.admit_pdf(
-            project_id="project-one",
+            project_id=project_id,
             paper_id="paper-one",
             source_path=write_pdf(tmp_path / "newer.pdf", suffix="newer"),
         )
-        DocumentImportService(service.repository_for_project_id("project-one")).publish(
+        DocumentImportService(service.repository_for_project_id(project_id)).publish(
             NativePdfParser(paths).parse(newer)
         )
     return db

@@ -9,6 +9,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import NoReturn
 
 from academic_chatbot.documents.import_service import DocumentImportService
 from academic_chatbot.documents.native_pdf import NativePdfParser
@@ -19,6 +20,16 @@ from academic_chatbot.embeddings.models import canonical_json_bytes
 from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profile
 from academic_chatbot.embeddings.repository import EmbeddingPersistenceError, EmbeddingRepository
 from academic_chatbot.embeddings.vector_build import ProjectVectorBuilder, VectorBuildError
+from academic_chatbot.evidence.models import EvidenceBundleError, EvidenceErrorCode, PreviewState
+from academic_chatbot.evidence.resolver import EvidenceReadResolver, EvidenceResolutionError
+from academic_chatbot.evidence.serialization import (
+    EvidencePreparationError,
+    canonical_bundle_bytes,
+    parse_bundle_request,
+    read_request_bytes,
+)
+from academic_chatbot.evidence.serialization import canonical_json_bytes as canonical_evidence_json
+from academic_chatbot.evidence.service import EvidenceBundleService
 from academic_chatbot.library.repository import ProjectRepository
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.retrieval.fts import RetrievalQueryError
@@ -50,11 +61,16 @@ class SemanticIndexBuildError(ValueError):
 def main(argv: Sequence[str] | None = None) -> int:
     """Run local commands and return a clean non-zero code for ordinary errors."""
 
-    parser = _parser()
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    parser = _parser(preview_errors=_is_evidence_invocation(tokens))
     try:
-        arguments = parser.parse_args(argv)
+        arguments = parser.parse_args(tokens)
+    except EvidencePreparationError as error:
+        return _write_evidence_error(error.error)
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2
+    if arguments.command == "evidence-bundle":
+        return _dispatch_evidence_preview(arguments)
     try:
         if arguments.max_pdf_bytes <= 0:
             raise ValueError("--max-pdf-bytes must be positive")
@@ -81,11 +97,73 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="academic_chatbot")
+class _EvidenceArgumentParser(argparse.ArgumentParser):
+    """Preview-only argument failures; ordinary help still uses argparse."""
+
+    def error(self, message: str) -> NoReturn:
+        raise EvidencePreparationError(EvidenceErrorCode.INVALID_REQUEST)
+
+
+def _is_evidence_invocation(tokens: Sequence[str]) -> bool:
+    """Resolve the root positional command while consuming global option values.
+
+    This preliminary grammar deliberately omits validation and required flags:
+    the full parser owns both, including malformed preview global arguments.
+    """
+    probe = _EvidenceArgumentParser(add_help=False)
+    probe.add_argument("--data-root")
+    probe.add_argument("--max-pdf-bytes")
+    probe.add_argument("command", nargs="?")
+    probe.add_argument("command_args", nargs=argparse.REMAINDER)
+    try:
+        namespace, _ = probe.parse_known_args(tokens)
+    except EvidencePreparationError:
+        return False
+    return bool(namespace.command == "evidence-bundle")
+
+
+def _write_evidence_error(error: EvidenceBundleError) -> int:
+    # Reconstruct only frozen public fields; never serialize exception details.
+    safe = EvidenceBundleError(code=error.code, input_position=error.input_position)
+    sys.stderr.buffer.write(canonical_evidence_json(safe.model_dump(mode="json")) + b"\n")
+    sys.stderr.buffer.flush()
+    return 2
+
+
+def _dispatch_evidence_preview(arguments: argparse.Namespace) -> int:
+    try:
+        if arguments.max_pdf_bytes <= 0:
+            raise EvidencePreparationError(EvidenceErrorCode.INVALID_REQUEST)
+        request = parse_bundle_request(read_request_bytes(sys.stdin.buffer))
+        service = EvidenceBundleService(
+            resolver=EvidenceReadResolver(data_root=Path(arguments.data_root))
+        )
+        bundle = service.build(request)
+        output = canonical_bundle_bytes(bundle) + b"\n"
+    except (EvidencePreparationError, EvidenceResolutionError) as error:
+        return _write_evidence_error(error.error)
+    except OSError:
+        return _write_evidence_error(
+            EvidenceBundleError(code=EvidenceErrorCode.STORAGE_UNAVAILABLE)
+        )
+    except Exception:
+        return _write_evidence_error(EvidenceBundleError(code=EvidenceErrorCode.STORAGE_INTEGRITY))
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.flush()
+    return 3 if bundle.state is PreviewState.INSUFFICIENT_EVIDENCE else 0
+
+
+def _parser(*, preview_errors: bool = False) -> argparse.ArgumentParser:
+    parser_type = _EvidenceArgumentParser if preview_errors else argparse.ArgumentParser
+    parser = parser_type(prog="academic_chatbot")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--max-pdf-bytes", type=int, required=True)
     commands = parser.add_subparsers(dest="command", required=True)
+    evidence = commands.add_parser("evidence-bundle").add_subparsers(
+        dest="evidence_command", required=True
+    )
+    preview = evidence.add_parser("preview")
+    preview.add_argument("--request-stdin", action="store_true", required=True)
     project = commands.add_parser("project").add_subparsers(dest="project_command", required=True)
     create_project = project.add_parser("create")
     create_project.add_argument("--project-id", required=True)
