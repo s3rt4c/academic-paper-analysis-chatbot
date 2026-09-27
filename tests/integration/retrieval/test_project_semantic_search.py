@@ -12,13 +12,24 @@ import pytest
 from academic_chatbot.db.connection import connect_project_database
 from academic_chatbot.domain.library import Project
 from academic_chatbot.embeddings.models import EmbeddingProfile, canonical_json_bytes
+from academic_chatbot.retrieval.selection import (
+    CanonicalPosition,
+    occurrence_identity,
+    select_guarded_earliest_auxiliary,
+)
 from academic_chatbot.retrieval.semantic import (
     SemanticArtifactIntegrityError,
     SemanticIndexStaleError,
     SemanticIndexUnavailableError,
+    SemanticQueryError,
     SemanticQueryTooLongError,
     SemanticRetrievalIntegrityError,
     SemanticRetrievalService,
+)
+from academic_chatbot.retrieval.semantic_position import PositionalAcquisitionSelection
+from academic_chatbot.retrieval.semantic_query import (
+    CANONICAL_CONCERN_TEXT,
+    SemanticQuerySelection,
 )
 from tests.integration.embeddings.test_vector_publication import (
     _builder,
@@ -177,6 +188,160 @@ def test_search_returns_current_exact_evidence_and_raw_cosine(tmp_path: Path) ->
     assert (hit.start_offset, hit.end_offset) == (0, 16)
     assert hit.chunk_id == "chunk-one"
     assert [anchor.anchor_text for anchor in hit.anchors] == ["alpha", "beta", "gamma"]
+
+
+def test_concern_selection_embeds_exact_canonical_text_and_preserves_user_query(
+    tmp_path: Path,
+) -> None:
+    service, query_embedder, _, _ = _active_service(tmp_path)
+    user_query = "Which finding is reported?"
+
+    results = service.search(
+        _project_value(),
+        user_query,
+        limit=1,
+        query_selection=SemanticQuerySelection(
+            mode="concern", concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert query_embedder.calls == [(CANONICAL_CONCERN_TEXT,)]
+    assert results.query == user_query
+    assert len(results.hits) == 1
+
+
+def test_positional_acquisition_returns_baseline_and_auxiliary_hits(tmp_path: Path) -> None:
+    service, query_embedder, _, built = _active_service(tmp_path)
+
+    acquisition = service.acquire_positional(
+        _project_value(),
+        "meaningful query",
+        limit=1,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert query_embedder.calls == [("meaningful query",)]
+    assert acquisition.project_id == "project-one"
+    assert acquisition.query == "meaningful query"
+    assert acquisition.vector_generation_id == built.generation.vector_generation_id
+    assert acquisition.baseline_hits == acquisition.examined_hits
+    assert acquisition.positional_hits == ()
+    assert acquisition.ordered_hits == acquisition.baseline_hits
+
+
+def test_guarded_selector_preserves_real_underfilled_acquisition(tmp_path: Path) -> None:
+    service, _, _, _ = _active_service(tmp_path)
+    acquisition = service.acquire_positional(
+        _project_value(),
+        "meaningful query",
+        limit=1,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+    positions = {
+        occurrence_identity(hit): CanonicalPosition(
+            occurrence_identity=occurrence_identity(hit),
+            document_generation_id=hit.document_generation_id,
+            page_id=hit.page_id,
+            absolute_start=hit.start_offset,
+            source_policy_id="semantic-positional-acquisition-v1",
+        )
+        for hit in acquisition.ordered_hits
+    }
+    before = acquisition
+
+    selected = select_guarded_earliest_auxiliary(
+        acquisition=acquisition,
+        current=acquisition.baseline_hits,
+        positions=positions,
+        selector_policy_id="guarded-earliest-aux-selector-v1",
+    )
+
+    assert selected == acquisition.baseline_hits
+    assert acquisition == before
+
+
+def test_positional_acquisition_preserves_original_query_and_selected_representation(
+    tmp_path: Path,
+) -> None:
+    service, query_embedder, _, _ = _active_service(tmp_path)
+    user_query = "Which finding is reported?"
+
+    acquisition = service.acquire_positional(
+        _project_value(),
+        user_query,
+        limit=1,
+        query_selection=SemanticQuerySelection(
+            mode="concern", concern_id="stated-study-objective-v1"
+        ),
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert query_embedder.calls == [(CANONICAL_CONCERN_TEXT,)]
+    assert acquisition.query == user_query
+
+
+def test_positional_acquisition_does_not_change_generic_search(tmp_path: Path) -> None:
+    service, _, _, _ = _active_service(tmp_path)
+    ordinary = service.search(_project_value(), "meaningful query", limit=1)
+
+    acquisition = service.acquire_positional(
+        _project_value(),
+        "meaningful query",
+        limit=1,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert ordinary.hits == acquisition.baseline_hits
+
+
+def test_positional_acquisition_rejects_another_project(tmp_path: Path) -> None:
+    service, _, _, _ = _active_service(tmp_path)
+
+    with pytest.raises(SemanticIndexUnavailableError):
+        service.acquire_positional(
+            Project(project_id="project-two", display_name="Other"),
+            "query",
+            positional_selection=PositionalAcquisitionSelection(
+                concern_id="stated-study-objective-v1"
+            ),
+        )
+
+
+def test_positional_acquisition_does_not_mutate_database(tmp_path: Path) -> None:
+    service, _, repository, _ = _active_service(tmp_path)
+    paths = repository._paths  # type: ignore[attr-defined]
+    before = paths.database_path.read_bytes()
+
+    service.acquire_positional(
+        _project_value(),
+        "meaningful query",
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert paths.database_path.read_bytes() == before
+
+
+def test_invalid_concern_selection_fails_before_embedding(tmp_path: Path) -> None:
+    service, query_embedder, _, _ = _active_service(tmp_path)
+
+    with pytest.raises(SemanticQueryError):
+        service.search(
+            _project_value(),
+            "Which finding is reported?",
+            query_selection=SemanticQuerySelection(mode="concern"),
+        )
+
+    assert query_embedder.calls == []
 
 
 def test_search_returns_empty_for_a_valid_empty_generation(tmp_path: Path) -> None:

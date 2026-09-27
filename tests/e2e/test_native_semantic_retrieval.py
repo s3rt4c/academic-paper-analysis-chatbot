@@ -4,7 +4,7 @@ import hashlib
 import json
 import socket
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +17,19 @@ from academic_chatbot.domain.library import Project
 from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profile
 from academic_chatbot.embeddings.repository import EmbeddingRepository
 from academic_chatbot.library.service import LibraryService
+from academic_chatbot.retrieval.hybrid_service import HybridRetrievalService
+from academic_chatbot.retrieval.selection import (
+    CanonicalPosition,
+    occurrence_identity,
+    select_guarded_earliest_auxiliary,
+)
 from academic_chatbot.retrieval.semantic import SemanticRetrievalService
+from academic_chatbot.retrieval.semantic_position import PositionalAcquisitionSelection
+from academic_chatbot.retrieval.semantic_query import (
+    CANONICAL_CONCERN_TEXT,
+    SemanticQuerySelection,
+)
+from academic_chatbot.retrieval.service import RetrievalService
 from academic_chatbot.storage.paths import ProjectPaths
 from tests.integration.embeddings.test_vector_publication import _builder, _Embedder, _profile
 
@@ -28,12 +40,35 @@ _PDF = Path(__file__).parents[1] / "fixtures" / "pdfs" / "native_anchor.pdf"
 class _QueryEmbedder:
     profile: object
     vector: np.ndarray
+    calls: list[tuple[str, ...]] = field(default_factory=list)
 
     def embed_queries(self, texts: tuple[str, ...]) -> np.ndarray:
+        self.calls.append(texts)
         return self.vector[np.newaxis, :].astype(np.float32, copy=True)
 
 
 def test_native_pdf_to_semantic_hit_preserves_active_evidence(tmp_path: Path) -> None:
+    service, project_value, query_embedder, _, file_version, built = _native_fixture(tmp_path)
+    results = service.search(project_value, "semantic native")
+    concern_results = service.search(
+        project_value,
+        "a different user question",
+        query_selection=SemanticQuerySelection(
+            mode="concern", concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert built.generation.vector_generation_id == results.hits[0].vector_generation_id
+    assert results.hits[0].file_version_id == file_version.file_version_id
+    assert results.hits[0].paper_id == "paper-one"
+    assert results.hits[0].anchors
+    assert concern_results.query == "a different user question"
+    assert concern_results.hits[0].vector_generation_id == built.generation.vector_generation_id
+    assert concern_results.hits[0].file_version_id == file_version.file_version_id
+    assert query_embedder.calls == [("semantic native",), (CANONICAL_CONCERN_TEXT,)]
+
+
+def _native_fixture(tmp_path: Path):
     data_root = tmp_path / "data"
     library = LibraryService(data_root=data_root, max_pdf_bytes=1_000_000)
     project = library.create_project(display_name="Native", project_id="project-one")
@@ -50,16 +85,95 @@ def test_native_pdf_to_semantic_hit_preserves_active_evidence(tmp_path: Path) ->
     document_embedder = _Embedder(profile)
     built = _builder(repository, paths, document_embedder).build(project_id=project.project_id)
     query_vector = document_embedder.embed_documents((document_embedder.calls[0][0],))[0]
-    results = SemanticRetrievalService(
+    query_embedder = _QueryEmbedder(profile, query_vector)
+    service = SemanticRetrievalService(
         data_root=data_root,
         profile=profile,
-        embedder=_QueryEmbedder(profile, query_vector),
-    ).search(Project(project_id=project.project_id, display_name="Native"), "semantic native")
+        embedder=query_embedder,
+    )
+    project_value = Project(project_id=project.project_id, display_name="Native")
+    return service, project_value, query_embedder, repository, file_version, built
 
-    assert built.generation.vector_generation_id == results.hits[0].vector_generation_id
-    assert results.hits[0].file_version_id == file_version.file_version_id
-    assert results.hits[0].paper_id == "paper-one"
-    assert results.hits[0].anchors
+
+def test_native_positional_acquisition_is_additive_and_bounded(tmp_path: Path) -> None:
+    service, project_value, _, _, _, _ = _native_fixture(tmp_path)
+    baseline = service.search(project_value, "semantic native", limit=1)
+
+    acquisition = service.acquire_positional(
+        project_value,
+        "semantic native",
+        limit=1,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert acquisition.baseline_hits == baseline.hits
+    assert acquisition.ordered_hits[: len(baseline.hits)] == baseline.hits
+    assert len(acquisition.examined_hits) <= 100
+    assert len(acquisition.positional_hits) <= 32
+
+
+def test_native_guarded_selector_preserves_current_lineage(tmp_path: Path) -> None:
+    service, project_value, _, _, _, _ = _native_fixture(tmp_path)
+    acquisition = service.acquire_positional(
+        project_value,
+        "semantic native",
+        limit=1,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+    positions = {
+        occurrence_identity(hit): CanonicalPosition(
+            occurrence_identity=occurrence_identity(hit),
+            document_generation_id=hit.document_generation_id,
+            page_id=hit.page_id,
+            absolute_start=hit.start_offset,
+            source_policy_id="semantic-positional-acquisition-v1",
+        )
+        for hit in acquisition.ordered_hits
+    }
+
+    selected = select_guarded_earliest_auxiliary(
+        acquisition=acquisition,
+        current=acquisition.baseline_hits,
+        positions=positions,
+        selector_policy_id="guarded-earliest-aux-selector-v1",
+    )
+
+    assert selected == acquisition.baseline_hits
+    assert selected[0].project_id == project_value.project_id
+    assert selected[0].file_version_id == acquisition.baseline_hits[0].file_version_id
+    assert selected[0].document_generation_id == acquisition.baseline_hits[0].document_generation_id
+    assert selected[0].vector_generation_id == acquisition.vector_generation_id
+
+
+def test_native_hybrid_positional_acquisition_preserves_rrf_contract(tmp_path: Path) -> None:
+    semantic, project_value, query_embedder, repository, _, _ = _native_fixture(tmp_path)
+    query_embedder.calls.clear()
+    hybrid = HybridRetrievalService(
+        data_root=repository._paths.data_root,  # type: ignore[attr-defined]
+        lexical_service=RetrievalService(data_root=repository._paths.data_root),  # type: ignore[attr-defined]
+        semantic_service=semantic,
+    )
+
+    result = hybrid.search(
+        project_value,
+        "semantic native",
+        limit=1,
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert query_embedder.calls == [("semantic native",)]
+    assert result.fusion_profile_id == "rrf-v1"
+    assert result.hits
+    assert all(
+        hit.lexical_contribution is not None or hit.semantic_contribution is not None
+        for hit in result.hits
+    )
 
 
 @dataclass(frozen=True)

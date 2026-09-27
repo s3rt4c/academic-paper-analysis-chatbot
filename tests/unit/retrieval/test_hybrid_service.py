@@ -8,7 +8,10 @@ import pytest
 
 from academic_chatbot.domain.library import Project
 from academic_chatbot.retrieval.hybrid_models import HybridParentChunkContext
-from academic_chatbot.retrieval.hybrid_service import HybridRetrievalService
+from academic_chatbot.retrieval.hybrid_service import (
+    HybridRetrievalIntegrityError,
+    HybridRetrievalService,
+)
 from academic_chatbot.retrieval.semantic import (
     SemanticArtifactIntegrityError,
     SemanticIndexStaleError,
@@ -16,6 +19,11 @@ from academic_chatbot.retrieval.semantic import (
     SemanticRetrievalHit,
     SemanticRetrievalResults,
 )
+from academic_chatbot.retrieval.semantic_position import (
+    PositionalAcquisitionSelection,
+    SemanticPositionalAcquisition,
+)
+from academic_chatbot.retrieval.semantic_query import SemanticQuerySelection
 from academic_chatbot.retrieval.service import RetrievalHit, RetrievalResults, RetrievalStorageError
 
 
@@ -104,10 +112,22 @@ class _LexicalService:
 class _SemanticService:
     hits: tuple[SemanticRetrievalHit, ...] = ()
     error: Exception | None = None
-    calls: list[tuple[Project, str, int]] = field(default_factory=list)
+    calls: list[tuple[Project, str, int, SemanticQuerySelection | None]] = field(
+        default_factory=list
+    )
+    positional_calls: list[
+        tuple[Project, str, int, SemanticQuerySelection | None, PositionalAcquisitionSelection]
+    ] = field(default_factory=list)
 
-    def search(self, project: Project, query: str, limit: int) -> SemanticRetrievalResults:
-        self.calls.append((project, query, limit))
+    def search(
+        self,
+        project: Project,
+        query: str,
+        limit: int,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+    ) -> SemanticRetrievalResults:
+        self.calls.append((project, query, limit, query_selection))
         if self.error is not None:
             raise self.error
         return SemanticRetrievalResults(
@@ -116,6 +136,34 @@ class _SemanticService:
             embedding_profile_id="profile-1",
             vector_generation_id="vector-1",
             hits=self.hits,
+        )
+
+    def acquire_positional(
+        self,
+        project: Project,
+        query: str,
+        limit: int,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+        positional_selection: PositionalAcquisitionSelection,
+    ) -> SemanticPositionalAcquisition:
+        self.positional_calls.append(
+            (project, query, limit, query_selection, positional_selection)
+        )
+        baseline = self.hits[:limit]
+        positional = self.hits[limit:]
+        return SemanticPositionalAcquisition(
+            project_id=project.project_id,
+            query=query,
+            embedding_profile_id="profile-1",
+            vector_generation_id="vector-1",
+            policy_id="semantic-positional-acquisition-v1",
+            concern_id=positional_selection.concern_id,
+            requested_limit=limit,
+            examined_hits=self.hits,
+            baseline_hits=baseline,
+            positional_hits=positional,
+            ordered_hits=baseline + positional,
         )
 
 
@@ -151,9 +199,143 @@ def test_search_passes_the_original_query_and_frozen_depth_to_both_channels() ->
     result = _service(lexical, semantic, resolver).search(_project(), "original query", limit=11)
 
     assert lexical.calls == [(_project(), "original query", 55)]
-    assert semantic.calls == [(_project(), "original query", 55)]
+    assert semantic.calls == [(_project(), "original query", 55, None)]
     assert len(result.hits) == 1
     assert result.hits[0].trace.fusion_rank == 1
+
+
+def test_search_forwards_one_explicit_selection_only_to_semantic() -> None:
+    lexical, semantic, resolver = (
+        _LexicalService(hits=(_lexical(),)),
+        _SemanticService(hits=(_semantic(),)),
+        _Resolver(),
+    )
+    selection = SemanticQuerySelection(
+        mode="concern", concern_id="stated-study-objective-v1"
+    )
+
+    result = _service(lexical, semantic, resolver).search(
+        _project(), "original query", limit=11, query_selection=selection
+    )
+
+    assert lexical.calls == [(_project(), "original query", 55)]
+    assert semantic.calls == [(_project(), "original query", 55, selection)]
+    assert result.query == "original query"
+    assert len(result.hits) == 1
+
+
+def test_hybrid_without_positional_selection_keeps_existing_calls() -> None:
+    lexical, semantic, resolver = (
+        _LexicalService(hits=(_lexical(),)),
+        _SemanticService(hits=(_semantic(),)),
+        _Resolver(),
+    )
+
+    result = _service(lexical, semantic, resolver).search(_project(), "query", limit=10)
+
+    assert lexical.calls == [(_project(), "query", 50)]
+    assert semantic.calls == [(_project(), "query", 50, None)]
+    assert semantic.positional_calls == []
+    assert result.fusion_profile_id == "rrf-v1"
+
+
+def test_hybrid_positional_selection_uses_one_semantic_union() -> None:
+    lexical, semantic, resolver = (
+        _LexicalService(hits=(_lexical(),)),
+        _SemanticService(
+            hits=(_semantic(rank=1), _semantic(chunk_id="chunk-2", rank=2))
+        ),
+        _Resolver(),
+    )
+    selection = PositionalAcquisitionSelection(
+        concern_id="stated-study-objective-v1"
+    )
+
+    result = _service(lexical, semantic, resolver).search(
+        _project(), "original query", limit=10, positional_selection=selection
+    )
+
+    assert lexical.calls == [(_project(), "original query", 50)]
+    assert semantic.calls == []
+    assert semantic.positional_calls == [
+        (_project(), "original query", 10, None, selection)
+    ]
+    assert result.query == "original query"
+    assert result.fusion_profile_id == "rrf-v1"
+
+
+def test_hybrid_positional_selection_keeps_lexical_query_unchanged() -> None:
+    lexical, semantic, resolver = (
+        _LexicalService(hits=(_lexical(),)),
+        _SemanticService(hits=(_semantic(),)),
+        _Resolver(),
+    )
+    selection = PositionalAcquisitionSelection(
+        concern_id="stated-study-objective-v1"
+    )
+
+    _service(lexical, semantic, resolver).search(
+        _project(), "user question", limit=10, positional_selection=selection
+    )
+
+    assert lexical.calls == [(_project(), "user question", 50)]
+
+
+def test_hybrid_positional_service_failure_fails_closed() -> None:
+    class _LegacySemanticService:
+        def search(
+            self,
+            project: Project,
+            query: str,
+            limit: int,
+            *,
+            query_selection: SemanticQuerySelection | None = None,
+        ) -> SemanticRetrievalResults:
+            return SemanticRetrievalResults(
+                project_id=project.project_id,
+                query=query,
+                embedding_profile_id="profile-1",
+                vector_generation_id="vector-1",
+                hits=(_semantic(),),
+            )
+
+    service = HybridRetrievalService(
+        data_root="unused",
+        lexical_service=_LexicalService(hits=(_lexical(),)),
+        semantic_service=_LegacySemanticService(),
+        parent_resolver=_Resolver(),
+    )
+
+    with pytest.raises(HybridRetrievalIntegrityError, match="positional"):
+        service.search(
+            _project(),
+            "query",
+            positional_selection=PositionalAcquisitionSelection(
+                concern_id="stated-study-objective-v1"
+            ),
+        )
+
+
+def test_hybrid_does_not_create_a_third_channel() -> None:
+    lexical, semantic, resolver = (
+        _LexicalService(hits=(_lexical(),)),
+        _SemanticService(hits=(_semantic(),)),
+        _Resolver(),
+    )
+
+    result = _service(lexical, semantic, resolver).search(
+        _project(),
+        "query",
+        positional_selection=PositionalAcquisitionSelection(
+            concern_id="stated-study-objective-v1"
+        ),
+    )
+
+    assert len(semantic.positional_calls) == 1
+    assert all(
+        hit.lexical_contribution is not None or hit.semantic_contribution is not None
+        for hit in result.hits
+    )
 
 
 def test_healthy_empty_channels_are_successful_and_stateful() -> None:

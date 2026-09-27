@@ -2,7 +2,35 @@
 
 ## Scope boundary
 
-This document summarizes the intended architecture of the Local Academic Paper Analysis Chatbot. It is a design direction, not a claim that every component below is implemented. The repository's completed Phase 0 work is limited to the feasibility evidence, safety boundaries, provenance records, and tests described in the README.
+This document separates the repository's implemented public behavior from its
+intended future architecture. Only capabilities listed in the next section are
+implemented; later sections remain design direction unless stated otherwise.
+
+## Implemented public state
+
+- Immutable native-PDF admission, page/span provenance, lexical retrieval,
+  semantic retrieval, and deterministic hybrid fusion are implemented.
+- Natural-language lexical planning, bounded deterministic multi-query
+  acquisition, concern-native semantic queries, additive positional semantic
+  acquisition, guarded auxiliary selection, and rank-only parent reranking are
+  explicit deterministic services. They do not guarantee retrieval recall or
+  representative academic-corpus ranking quality.
+- The Phase 2 evidence layer validates explicit candidate references against
+  authoritative source/version/generation state and creates deterministic,
+  byte- and entry-bounded EvidenceBundle previews.
+- `EvidenceGroup` v1 represents exactly two explicit known children and packs
+  them atomically. Automatic member discovery is not implemented.
+- Analysis proposal models are caller assertions, not final decisions and not
+  authorization for factual output.
+- The supported-objective verifier is deterministic and supported-only. For
+  standalone evidence, each cited value must be exact UTF-8 source text; no
+  whitespace, case, Unicode, qualifier, or numeric normalization occurs.
+- EvidenceGroup authority and both children are revalidated, after which scalar
+  value projection abstains because no deterministic two-child projection is
+  authorized.
+- Generation is disabled. There is no semantic-entailment or paraphrase
+  verifier, no production inference/conflict/`not_reported`/unreadable decision
+  engine, and no tokenizer/model/`llama.cpp` answer-generation path.
 
 ## Intended local analysis flow
 
@@ -30,7 +58,7 @@ The intended default is local analysis. Private documents, derived text, indexes
 
 Local runtime/model files, credentials, working data, logs, and exports are excluded from version control. Provenance manifests may record public upstream URLs, versions, and hashes without bundling the referenced artifacts.
 
-## Phase 0 evidence relationship
+## Earlier Phase 0 evidence relationship
 
 Phase 0 validates individual foundations for this direction:
 
@@ -39,4 +67,7 @@ Phase 0 validates individual foundations for this direction:
 - pinned local runtime/model identity checks;
 - bounded local inference lifecycle, graceful shutdown, cancellation recovery, and partial-result quarantine.
 
-It does not deliver the complete ingestion, OCR, chunking, hybrid retrieval, evidence-chat, discovery, or packaging layers above. Those remain roadmap work.
+Phase 0 did not itself deliver the later document, retrieval, evidence, or
+verification slices now listed as implemented above. OCR execution, a complete
+Evidence Chat workflow, broader analysis decision engines, discovery,
+generation, and release packaging remain intended future work.

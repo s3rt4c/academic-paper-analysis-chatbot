@@ -28,6 +28,22 @@ from academic_chatbot.embeddings.tokenizer import EmbeddingInputError, Embedding
 from academic_chatbot.embeddings.vector_build import _profile_sha256, _verify_empty_artifact
 from academic_chatbot.ports.documents import NativePdfAnchor
 from academic_chatbot.retrieval.exact_memmap import ExactVectorStore, VectorHit
+from academic_chatbot.retrieval.semantic_position import (
+    MAX_POSITIONAL_HITS_EXAMINED,
+    MAX_POSITIONED_DOCUMENT_GENERATIONS,
+    MAX_POSITIONED_PAGE_ROWS,
+    PositionalAcquisitionSelection,
+    PositionedPage,
+    SemanticPositionalAcquisition,
+    SemanticPositionalAcquisitionError,
+    build_positional_acquisition,
+    validate_positional_selection,
+)
+from academic_chatbot.retrieval.semantic_query import (
+    SemanticQueryPolicyError,
+    SemanticQuerySelection,
+    resolve_semantic_query,
+)
 from academic_chatbot.retrieval.service import _required_text, anchor_from_row
 from academic_chatbot.storage.paths import PathEscapeError, ProjectPaths
 
@@ -163,11 +179,22 @@ class SemanticRetrievalService:
             ) from error
         return cls(data_root=data_root, profile=profile, embedder=embedder)
 
-    def search(self, project: Project, query: str, limit: int = 10) -> SemanticRetrievalResults:
+    def search(
+        self,
+        project: Project,
+        query: str,
+        limit: int = 10,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+    ) -> SemanticRetrievalResults:
         if type(limit) is not int or limit <= 0:
             raise SemanticQueryError("limit must be a positive integer")
         if not isinstance(query, str) or not query.strip():
             raise SemanticQueryError("semantic query must not be empty or whitespace-only")
+        try:
+            representation = resolve_semantic_query(query, query_selection)
+        except SemanticQueryPolicyError as error:
+            raise SemanticQueryError("semantic query selection is invalid") from error
         paths = ProjectPaths.create(self._data_root, project_id=project.project_id)
         try:
             connection = open_read_only_connection(paths.database_path, data_root=self._data_root)
@@ -195,8 +222,91 @@ class SemanticRetrievalService:
                 generation=generation,
                 project=project,
                 query=query,
+                query_representation=representation.text,
                 limit=limit,
             )
+        except sqlite3.DatabaseError as error:
+            raise SemanticRetrievalIntegrityError(
+                "semantic retrieval database state is invalid"
+            ) from error
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def acquire_positional(
+        self,
+        project: Project,
+        query: str,
+        limit: int = 10,
+        *,
+        query_selection: SemanticQuerySelection | None = None,
+        positional_selection: PositionalAcquisitionSelection,
+    ) -> SemanticPositionalAcquisition:
+        """Acquire the unchanged semantic baseline plus a bounded position lane."""
+
+        if type(limit) is not int or limit <= 0:
+            raise SemanticQueryError("limit must be a positive integer")
+        if limit > MAX_POSITIONAL_HITS_EXAMINED:
+            raise SemanticQueryError("positional limit exceeds the acquisition bound")
+        if not isinstance(query, str) or not query.strip():
+            raise SemanticQueryError("semantic query must not be empty or whitespace-only")
+        try:
+            representation = resolve_semantic_query(query, query_selection)
+            validate_positional_selection(positional_selection)
+        except SemanticQueryPolicyError as error:
+            raise SemanticQueryError("semantic query selection is invalid") from error
+        except SemanticPositionalAcquisitionError as error:
+            raise SemanticQueryError("positional selection is invalid") from error
+
+        paths = ProjectPaths.create(self._data_root, project_id=project.project_id)
+        try:
+            connection = open_read_only_connection(paths.database_path, data_root=self._data_root)
+        except DatabasePathError as error:
+            raise SemanticIndexUnavailableError(
+                "semantic index is not built for this project"
+            ) from error
+        try:
+            connection.execute("BEGIN")
+            generation = _active_generation(
+                connection, project_id=project.project_id, profile=self.profile
+            )
+            current_sources, current_snapshot = _current_snapshot(
+                connection,
+                project_id=project.project_id,
+                embedding_profile_id=self.profile.embedding_profile_id,
+            )
+            if generation.source_snapshot_sha256 != current_snapshot:
+                raise SemanticIndexStaleError("published semantic index is stale")
+            if _generation_sources(connection, generation.vector_generation_id) != current_sources:
+                raise SemanticIndexStaleError("published semantic index source lineage is stale")
+            hits = self._search_active_hits(
+                connection=connection,
+                paths=paths,
+                generation=generation,
+                project=project,
+                query=query,
+                query_representation=representation.text,
+                limit=MAX_POSITIONAL_HITS_EXAMINED,
+            )
+            pages = _positioned_pages(
+                connection,
+                generation_id=generation.vector_generation_id,
+                hits=hits,
+            )
+            return build_positional_acquisition(
+                project_id=project.project_id,
+                query=query,
+                embedding_profile_id=self.profile.embedding_profile_id,
+                vector_generation_id=generation.vector_generation_id,
+                examined_hits=hits,
+                pages=pages,
+                requested_limit=limit,
+                selection=positional_selection,
+            )
+        except SemanticPositionalAcquisitionError as error:
+            raise SemanticRetrievalIntegrityError(
+                "semantic positional acquisition is invalid"
+            ) from error
         except sqlite3.DatabaseError as error:
             raise SemanticRetrievalIntegrityError(
                 "semantic retrieval database state is invalid"
@@ -213,8 +323,37 @@ class SemanticRetrievalService:
         generation: _Generation,
         project: Project,
         query: str,
+        query_representation: str,
         limit: int,
     ) -> SemanticRetrievalResults:
+        hits = self._search_active_hits(
+            connection=connection,
+            paths=paths,
+            generation=generation,
+            project=project,
+            query=query,
+            query_representation=query_representation,
+            limit=limit,
+        )
+        return SemanticRetrievalResults(
+            project_id=project.project_id,
+            query=query,
+            embedding_profile_id=self.profile.embedding_profile_id,
+            vector_generation_id=generation.vector_generation_id,
+            hits=hits,
+        )
+
+    def _search_active_hits(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        paths: ProjectPaths,
+        generation: _Generation,
+        project: Project,
+        query: str,
+        query_representation: str,
+        limit: int,
+    ) -> tuple[SemanticRetrievalHit, ...]:
         artifact = _artifact_path(
             paths,
             generation.artifact_relative_dir,
@@ -241,13 +380,7 @@ class SemanticRetrievalService:
                 raise SemanticArtifactIntegrityError(
                     "empty semantic artifact is corrupt"
                 ) from error
-            return SemanticRetrievalResults(
-                project_id=project.project_id,
-                query=query,
-                embedding_profile_id=self.profile.embedding_profile_id,
-                vector_generation_id=generation.vector_generation_id,
-                hits=(),
-            )
+            return ()
 
         mapping = _mapping(connection, generation.vector_generation_id)
         _require_ordinary_artifact_files(artifact, empty=False)
@@ -274,7 +407,7 @@ class SemanticRetrievalService:
                 raise SemanticArtifactIntegrityError(
                     "published vector artifact does not match its metadata"
                 )
-            query_vector = self._embed_query(query)
+            query_vector = self._embed_query(query_representation)
             try:
                 vector_hits = store.search(query_vector, limit=limit, block_rows=4096)
             except (TypeError, ValueError) as error:
@@ -294,13 +427,7 @@ class SemanticRetrievalService:
             )
         finally:
             store.close()
-        return SemanticRetrievalResults(
-            project_id=project.project_id,
-            query=query,
-            embedding_profile_id=self.profile.embedding_profile_id,
-            vector_generation_id=generation.vector_generation_id,
-            hits=hits,
-        )
+        return hits
 
     def _embed_query(self, query: str) -> np.ndarray:
         try:
@@ -437,6 +564,57 @@ def _mapping(connection: sqlite3.Connection, generation_id: str) -> tuple[tuple[
         (generation_id,),
     ).fetchall()
     return tuple((int(row[0]), str(row[1])) for row in rows)
+
+
+def _positioned_pages(
+    connection: sqlite3.Connection,
+    *,
+    generation_id: str,
+    hits: Sequence[SemanticRetrievalHit],
+) -> tuple[PositionedPage, ...]:
+    """Load bounded canonical page lengths for the examined semantic documents."""
+
+    document_generation_ids = tuple(sorted({hit.document_generation_id for hit in hits}))
+    if len(document_generation_ids) > MAX_POSITIONED_DOCUMENT_GENERATIONS:
+        raise SemanticPositionalAcquisitionError(
+            "positioned document generation metadata exceeds the bound"
+        )
+    if not document_generation_ids:
+        return ()
+    placeholders = ", ".join("?" for _ in document_generation_ids)
+    rows = connection.execute(
+        f"""SELECT source.document_generation_id, page.page_id, page.physical_page_index,
+        length(page.canonical_text) AS canonical_text_length
+        FROM vector_generation_sources AS source
+        JOIN pages AS page ON page.document_generation_id = source.document_generation_id
+        WHERE source.vector_generation_id = ?
+          AND source.document_generation_id IN ({placeholders})
+        ORDER BY source.document_generation_id, page.physical_page_index, page.page_id
+        LIMIT ?""",
+        (generation_id, *document_generation_ids, MAX_POSITIONED_PAGE_ROWS + 1),
+    ).fetchall()
+    if len(rows) > MAX_POSITIONED_PAGE_ROWS:
+        raise SemanticPositionalAcquisitionError("positioned page metadata exceeds the bound")
+    pages: list[PositionedPage] = []
+    try:
+        for row in rows:
+            pages.append(
+                PositionedPage(
+                    document_generation_id=str(row["document_generation_id"]),
+                    page_id=str(row["page_id"]),
+                    physical_page_index=int(row["physical_page_index"]),
+                    canonical_text_length=int(row["canonical_text_length"]),
+                )
+            )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SemanticPositionalAcquisitionError(
+            "positioned page metadata is malformed"
+        ) from error
+    if {page.document_generation_id for page in pages} != set(document_generation_ids):
+        raise SemanticPositionalAcquisitionError(
+            "positioned page metadata is missing for a semantic document"
+        )
+    return tuple(pages)
 
 
 def _artifact_path(
