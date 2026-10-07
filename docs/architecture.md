@@ -28,9 +28,38 @@ implemented; later sections remain design direction unless stated otherwise.
 - EvidenceGroup authority and both children are revalidated, after which scalar
   value projection abstains because no deterministic two-child projection is
   authorized.
-- Generation is disabled. There is no semantic-entailment or paraphrase
-  verifier, no production inference/conflict/`not_reported`/unreadable decision
-  engine, and no tokenizer/model/`llama.cpp` answer-generation path.
+- The bounded MVP implements local `llama.cpp` answer generation through a
+  single-paper `ask` CLI, with exact template/tokenizer admission, strict
+  structured output, citation validation, and currentness rechecks.
+- There is no semantic-entailment or paraphrase verifier and no production
+  inference/conflict/`not_reported`/unreadable decision engine.
+
+## Implemented MVP answer flow
+
+```text
+single selected paper -> retrieval -> EvidenceBundle -> bounded context
+-> template/tokenizer admission -> local llama.cpp -> strict output
+-> citation validation -> currentness check -> CLI answer
+```
+
+Source admission requires exactly one published current FileVersion for the
+selected paper. Retrieval hits are scoped to that paper and its admitted source
+before evidence preparation. Nonready evidence previews abstain before model
+access. Paper text remains untrusted data inside the rendered context.
+
+The verified session renders the template, counts tokens, and generates with
+one frozen runtime/model pair. Admission enforces rendered prompt tokens plus
+1024 reserved output tokens within the 4096-token context. Strict output must
+contain an answer and valid evidence citation labels. The service rebuilds the
+authoritative bundle and rechecks the selected source before releasing a result.
+These checks validate references and currentness; they do not prove semantic
+entailment, evidence completeness, or factual correctness.
+
+This path uses loopback-only local transport and externally provisioned model
+artifacts. It adds no persistence migration or dependency. It does not implement
+multi-paper synthesis, an API/UI, OCR execution, automatic five-status
+classification, or the broader staged-analysis design below. Acceptance evidence
+is recorded in [mvp-validation.md](mvp-validation.md).
 
 ## Intended local analysis flow
 
@@ -70,4 +99,4 @@ Phase 0 validates individual foundations for this direction:
 Phase 0 did not itself deliver the later document, retrieval, evidence, or
 verification slices now listed as implemented above. OCR execution, a complete
 Evidence Chat workflow, broader analysis decision engines, discovery,
-generation, and release packaging remain intended future work.
+multi-paper synthesis, and release packaging remain intended future work.
