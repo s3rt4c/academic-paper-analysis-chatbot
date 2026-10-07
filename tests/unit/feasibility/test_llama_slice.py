@@ -9313,6 +9313,68 @@ class _Step8HttpClientFactory:
         return self.clients.pop(0)
 
 
+def test_mvp_prompt_control_endpoints_are_authenticated_bounded_loopback() -> None:
+    apply_url = "http://127.0.0.1:49152/apply-template"
+    tokenize_url = "http://127.0.0.1:49152/tokenize"
+    apply_response = _Step8HttpResponse(
+        url=apply_url,
+        headers={"content-type": "application/json"},
+        items=[b'{"prompt":"rendered"}'],
+    )
+    tokenize_response = _Step8HttpResponse(
+        url=tokenize_url,
+        headers={"content-type": "application/json"},
+        items=[b'{"tokens":[1,2]}'],
+    )
+    clients = [_Step8HttpClient([apply_response]), _Step8HttpClient([tokenize_response])]
+    factory = _Step8HttpClientFactory(clients)
+    transport = llama_slice.open_llama_loopback_http_transport(
+        bound_port=49_152,
+        api_key=_STEP8_API_KEY,
+        client_factory=factory,  # type: ignore[arg-type]
+    )
+
+    applied = transport.post_apply_template(b'{"messages":[]}')
+    tokenized = transport.post_tokenize(
+        b'{"add_special":true,"content":"rendered","parse_special":true,'
+        b'"with_pieces":false}'
+    )
+
+    assert applied.body == b'{"prompt":"rendered"}'
+    assert tokenized.body == b'{"tokens":[1,2]}'
+    requests = [request for client in clients for request in client.requests]
+    assert [request["url"] for request in requests] == [apply_url, tokenize_url]
+    assert all(
+        request["headers"]["Authorization"] == f"Bearer {_STEP8_API_KEY}"  # type: ignore[index]
+        for request in requests
+    )
+    assert all(request["follow_redirects"] is False for request in requests)
+    assert all(
+        call["timeout"].read == llama_slice.LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS  # type: ignore[union-attr]
+        for call in factory.calls
+    )
+
+
+def test_mvp_prompt_control_endpoint_rejects_redirect() -> None:
+    url = "http://127.0.0.1:49152/apply-template"
+    response = _Step8HttpResponse(
+        url=url,
+        status_code=307,
+        headers={"content-type": "application/json"},
+        history=(object(),),
+    )
+    transport = llama_slice.open_llama_loopback_http_transport(
+        bound_port=49_152,
+        api_key=_STEP8_API_KEY,
+        client_factory=_Step8HttpClientFactory([_Step8HttpClient([response])]),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(llama_slice.LlamaSliceHttpError) as error:
+        transport.post_apply_template(b'{"messages":[]}')
+
+    assert error.value.code == "redirect_rejected"
+
+
 def test_step8_http_transport_uses_frozen_loopback_client_and_authenticated_chat() -> None:
     url = "http://127.0.0.1:49152/v1/chat/completions"
     response = _Step8HttpResponse(url=url, items=[b"first", b"second"])

@@ -14516,6 +14516,30 @@ def parse_llama_chat_completion_stream(
     _raise_llama_response_error(failure_code)
 
 
+def parse_llama_chat_completion_stream_for_generation(
+    *,
+    stream: LlamaSseByteStream,
+    clock: LlamaMonotonicClock,
+    request_started_ns: int,
+    expected_version: LlamaServerVersion,
+) -> StructuredGenerationResult:
+    """Strict SSE parser that preserves sanitized HTTP deadline failures."""
+
+    try:
+        return _parse_llama_chat_completion_stream(
+            stream=stream,
+            clock=clock,
+            request_started_ns=request_started_ns,
+            expected_version=expected_version,
+        )
+    except MemoryError:
+        raise
+    except (LlamaSliceHttpError, LlamaSliceResponseError):
+        raise
+    except Exception:
+        _raise_llama_response_error("invalid_stream")
+
+
 def _raise_llama_http_error(code: LlamaHttpFailureCode) -> NoReturn:
     raise LlamaSliceHttpError(code) from None
 
@@ -14938,7 +14962,15 @@ class LlamaHttpxLoopbackTransport:
 
     def _url(
         self,
-        endpoint: Literal["/completion", "/health", "/props", "/slots", "/v1/chat/completions"],
+        endpoint: Literal[
+            "/apply-template",
+            "/completion",
+            "/health",
+            "/props",
+            "/slots",
+            "/tokenize",
+            "/v1/chat/completions",
+        ],
     ) -> str:
         return f"http://127.0.0.1:{self._bound_port}{endpoint}"
 
@@ -15044,7 +15076,15 @@ class LlamaHttpxLoopbackTransport:
         self,
         *,
         method: Literal["GET", "POST"],
-        endpoint: Literal["/completion", "/health", "/props", "/slots", "/v1/chat/completions"],
+        endpoint: Literal[
+            "/apply-template",
+            "/completion",
+            "/health",
+            "/props",
+            "/slots",
+            "/tokenize",
+            "/v1/chat/completions",
+        ],
         body: bytes | None,
         authenticated: bool,
         accept: Literal["application/json", "text/event-stream"],
@@ -15195,7 +15235,9 @@ class LlamaHttpxLoopbackTransport:
         self,
         *,
         method: Literal["GET", "POST"],
-        endpoint: Literal["/completion", "/health", "/props", "/slots"],
+        endpoint: Literal[
+            "/apply-template", "/completion", "/health", "/props", "/slots", "/tokenize"
+        ],
         body: bytes | None,
         authenticated: bool,
         allowed_statuses: frozenset[int],
@@ -15372,6 +15414,62 @@ class LlamaHttpxLoopbackTransport:
                 allowed_statuses=frozenset({200}),
                 maximum_bytes=MAX_LLAMA_COMPLETION_BODY_BYTES,
                 read_timeout_seconds=LLAMA_HTTP_RECOVERY_COMPLETION_READ_TIMEOUT_SECONDS,
+                total_timeout_seconds=total_timeout_seconds,
+            )
+        except MemoryError:
+            raise
+        except LlamaSliceHttpError as error:
+            failure_code = error.code
+        except Exception as error:
+            failure_code = _llama_http_failure_code(error)
+        del self, body, total_timeout_seconds
+        _raise_llama_http_error(failure_code)
+
+    def post_apply_template(
+        self,
+        body: bytes,
+        *,
+        total_timeout_seconds: float = LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS,
+    ) -> LlamaHttpBody:
+        """Render one authenticated chat request on the bound server."""
+
+        try:
+            return self._read_body(
+                method="POST",
+                endpoint="/apply-template",
+                body=body,
+                authenticated=True,
+                allowed_statuses=frozenset({200}),
+                maximum_bytes=MAX_LLAMA_PROPS_BODY_BYTES,
+                read_timeout_seconds=LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS,
+                total_timeout_seconds=total_timeout_seconds,
+            )
+        except MemoryError:
+            raise
+        except LlamaSliceHttpError as error:
+            failure_code = error.code
+        except Exception as error:
+            failure_code = _llama_http_failure_code(error)
+        del self, body, total_timeout_seconds
+        _raise_llama_http_error(failure_code)
+
+    def post_tokenize(
+        self,
+        body: bytes,
+        *,
+        total_timeout_seconds: float = LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS,
+    ) -> LlamaHttpBody:
+        """Tokenize one rendered prompt on the bound server."""
+
+        try:
+            return self._read_body(
+                method="POST",
+                endpoint="/tokenize",
+                body=body,
+                authenticated=True,
+                allowed_statuses=frozenset({200}),
+                maximum_bytes=MAX_LLAMA_PROPS_BODY_BYTES,
+                read_timeout_seconds=LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS,
                 total_timeout_seconds=total_timeout_seconds,
             )
         except MemoryError:
@@ -16529,6 +16627,93 @@ def run_llama_disconnect_cancellation_probe(
     _raise_llama_cancellation_error(failure_code)
 
 
+def recover_llama_after_disconnect(
+    *,
+    transport: LlamaHttpxLoopbackTransport,
+    clock: LlamaMonotonicClock,
+    wait_strategy: LlamaWaitStrategy,
+) -> None:
+    """Prove bounded idle, health and one-token recovery after a closed stream."""
+
+    try:
+        started_ns = _read_llama_cancellation_clock(clock, previous_ns=None)
+        deadline_ns = started_ns + int(
+            LLAMA_CANCELLATION_RECOVERY_TIMEOUT_SECONDS * 1_000_000_000
+        )
+        previous_ns = started_ns
+        for poll_index in range(MAX_LLAMA_CANCELLATION_SLOT_POLLS):
+            remaining_seconds = (deadline_ns - previous_ns) / 1_000_000_000.0
+            if remaining_seconds <= 0.0:
+                raise ValueError("slot recovery exhausted its deadline")
+            slot_state = fetch_llama_single_slot_state(
+                transport=transport,
+                total_timeout_seconds=min(
+                    LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS,
+                    remaining_seconds,
+                ),
+            )
+            observed_ns = _read_llama_cancellation_clock(
+                clock, previous_ns=previous_ns
+            )
+            previous_ns = observed_ns
+            if observed_ns > deadline_ns:
+                raise ValueError("slot recovery exceeded its deadline")
+            if not slot_state.is_processing:
+                break
+            if poll_index + 1 >= MAX_LLAMA_CANCELLATION_SLOT_POLLS:
+                raise ValueError("slot recovery exceeded its poll bound")
+            remaining_seconds = (deadline_ns - observed_ns) / 1_000_000_000.0
+            wait_seconds = min(
+                LLAMA_CANCELLATION_POLL_INTERVAL_SECONDS,
+                remaining_seconds,
+            )
+            if wait_seconds <= 0.0:
+                raise ValueError("slot recovery wait failed")
+            wait_strategy.wait(wait_seconds)
+            previous_ns = _read_llama_cancellation_clock(
+                clock, previous_ns=previous_ns
+            )
+            if previous_ns > deadline_ns:
+                raise ValueError("slot recovery wait exceeded its deadline")
+        else:
+            raise ValueError("slot recovery exceeded its poll bound")
+
+        remaining_seconds = (deadline_ns - previous_ns) / 1_000_000_000.0
+        if remaining_seconds <= 0.0 or fetch_llama_health_state(
+            transport=transport,
+            total_timeout_seconds=min(
+                LLAMA_HTTP_CONTROL_READ_TIMEOUT_SECONDS,
+                remaining_seconds,
+            ),
+        ) != "ready":
+            raise ValueError("server health did not recover")
+        previous_ns = _read_llama_cancellation_clock(
+            clock, previous_ns=previous_ns
+        )
+        remaining_seconds = (deadline_ns - previous_ns) / 1_000_000_000.0
+        if remaining_seconds <= 0.0:
+            raise ValueError("one-token recovery exhausted its deadline")
+        response = transport.post_one_token_completion(
+            _llama_cancellation_recovery_request_body(),
+            total_timeout_seconds=min(
+                LLAMA_HTTP_RECOVERY_COMPLETION_READ_TIMEOUT_SECONDS,
+                remaining_seconds,
+            ),
+        )
+        validate_llama_one_token_completion_response(
+            status_code=response.status_code,
+            body=response.body,
+        )
+        if _read_llama_cancellation_clock(clock, previous_ns=previous_ns) > deadline_ns:
+            raise ValueError("one-token recovery exceeded its deadline")
+    except MemoryError:
+        raise
+    except LlamaSliceCancellationError:
+        raise
+    except Exception:
+        _raise_llama_cancellation_error("recovery_failed")
+
+
 class _SystemLlamaClock:
     """Production monotonic clock adapter for live feasibility work."""
 
@@ -16984,13 +17169,12 @@ class _LlamaCudaOperationResult:
     partial_result_quarantine: LlamaPartialResultQuarantineEvidence
 
 
-def _run_verified_llama_session(
+def _run_verified_llama_session_core(
     *,
     runtime_directory: Path,
     runtime_manifest: LlamaRuntimeManifest,
     model_path: Path,
     model_manifest: GgufModelManifest,
-    fixture: CitedAnswerFixture,
     expected_version: LlamaServerVersion,
     inherited_environment: Mapping[str, str],
     api: LlamaWindowsProcessApi,
@@ -17000,7 +17184,6 @@ def _run_verified_llama_session(
 ) -> _CompletedLlamaSession:
     """Own one verified server from fresh lease/key creation through shutdown."""
 
-    validated_fixture = _revalidate_cited_answer_fixture(fixture)
     validated_version = _revalidate_llama_server_version(expected_version)
     if not callable(operation):
         _raise_llama_lifecycle_error("invalid_configuration")
@@ -17054,12 +17237,6 @@ def _run_verified_llama_session(
             expected_version=validated_version,
         )
         fetch_llama_idle_slot(transport=transport)
-        generate_cited_answer_over_http(
-            transport=transport,
-            fixture=validated_fixture,
-            clock=clock,
-            expected_version=validated_version,
-        )
         payload = operation(transport, validated_version)
     except BaseException as error:
         primary_error = error
@@ -17101,6 +17278,147 @@ def _run_verified_llama_session(
         props=props,
         session=session_evidence,
         payload=payload,
+    )
+
+
+def run_verified_llama_session_operation(
+    *,
+    runtime_directory: Path,
+    runtime_manifest: LlamaRuntimeManifest,
+    model_path: Path,
+    model_manifest: GgufModelManifest,
+    expected_version: LlamaServerVersion,
+    inherited_environment: Mapping[str, str],
+    api: LlamaWindowsProcessApi,
+    clock: LlamaMonotonicClock,
+    wait_strategy: LlamaWaitStrategy,
+    operation: Callable[[LlamaHttpxLoopbackTransport, LlamaServerVersion], object],
+) -> object:
+    """Run one caller operation inside the proven verified server lifecycle."""
+
+    return _run_verified_llama_session_core(
+        runtime_directory=runtime_directory,
+        runtime_manifest=runtime_manifest,
+        model_path=model_path,
+        model_manifest=model_manifest,
+        expected_version=expected_version,
+        inherited_environment=inherited_environment,
+        api=api,
+        clock=clock,
+        wait_strategy=wait_strategy,
+        operation=operation,
+    ).payload
+
+
+def run_verified_llama_operation(
+    *,
+    runtime_directory: Path,
+    runtime_manifest: LlamaRuntimeManifest,
+    model_path: Path,
+    model_manifest: GgufModelManifest,
+    operation: Callable[
+        [
+            LlamaHttpxLoopbackTransport,
+            LlamaServerVersion,
+            LlamaMonotonicClock,
+            LlamaWaitStrategy,
+        ],
+        object,
+    ],
+) -> object:
+    """Verify artifacts/runtime, then execute one operation in a fresh session."""
+
+    inherited_environment = dict(os.environ)
+    api = CtypesLlamaWindowsProcessApi()
+    clock = _SystemLlamaClock()
+    wait_strategy = _SystemLlamaWaitStrategy()
+    _preflight_llama_run_artifacts(
+        runtime_directory=runtime_directory,
+        runtime_manifest=runtime_manifest,
+        model_path=model_path,
+        model_manifest=model_manifest,
+    )
+    version = _probe_llama_runtime_compatibility(
+        runtime_directory=runtime_directory,
+        runtime_manifest=runtime_manifest,
+        model_path=model_path,
+        model_manifest=model_manifest,
+        probe_kind="version",
+        inherited_environment=inherited_environment,
+        api=api,
+        clock=clock,
+        wait_strategy=wait_strategy,
+    )
+    if type(version) is not LlamaServerVersion:
+        raise LlamaSliceStartupError("Llama runtime identity probe did not complete.")
+    _probe_llama_runtime_compatibility(
+        runtime_directory=runtime_directory,
+        runtime_manifest=runtime_manifest,
+        model_path=model_path,
+        model_manifest=model_manifest,
+        probe_kind="list_devices",
+        inherited_environment=inherited_environment,
+        api=api,
+        clock=clock,
+        wait_strategy=wait_strategy,
+    )
+    return run_verified_llama_session_operation(
+        runtime_directory=runtime_directory,
+        runtime_manifest=runtime_manifest,
+        model_path=model_path,
+        model_manifest=model_manifest,
+        expected_version=version,
+        inherited_environment=inherited_environment,
+        api=api,
+        clock=clock,
+        wait_strategy=wait_strategy,
+        operation=lambda transport, expected: operation(
+            transport, expected, clock, wait_strategy
+        ),
+    )
+
+
+def _run_verified_llama_session(
+    *,
+    runtime_directory: Path,
+    runtime_manifest: LlamaRuntimeManifest,
+    model_path: Path,
+    model_manifest: GgufModelManifest,
+    fixture: CitedAnswerFixture,
+    expected_version: LlamaServerVersion,
+    inherited_environment: Mapping[str, str],
+    api: LlamaWindowsProcessApi,
+    clock: LlamaMonotonicClock,
+    wait_strategy: LlamaWaitStrategy,
+    operation: Callable[[LlamaHttpxLoopbackTransport, LlamaServerVersion], object],
+) -> _CompletedLlamaSession:
+    """Preserve the Phase 0 fixture warm-up API on the generalized lifecycle."""
+
+    validated_fixture = _revalidate_cited_answer_fixture(fixture)
+
+    def warmed_operation(
+        transport: LlamaHttpxLoopbackTransport,
+        version: LlamaServerVersion,
+    ) -> object:
+        generate_cited_answer_over_http(
+            transport=transport,
+            fixture=validated_fixture,
+            clock=clock,
+            expected_version=version,
+        )
+        return operation(transport, version)
+
+    return _run_verified_llama_session_core(
+        runtime_directory=runtime_directory,
+        runtime_manifest=runtime_manifest,
+        model_path=model_path,
+        model_manifest=model_manifest,
+        expected_version=expected_version,
+        inherited_environment=inherited_environment,
+        api=api,
+        clock=clock,
+        wait_strategy=wait_strategy,
+        operation=warmed_operation,
     )
 
 
