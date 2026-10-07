@@ -9,7 +9,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from academic_chatbot.documents.import_service import DocumentImportService
 from academic_chatbot.documents.native_pdf import NativePdfParser
@@ -32,9 +32,34 @@ from academic_chatbot.evidence.serialization import (
 )
 from academic_chatbot.evidence.serialization import canonical_json_bytes as canonical_evidence_json
 from academic_chatbot.evidence.service import EvidenceBundleService
+from academic_chatbot.feasibility.llama_slice import (
+    LlamaSliceManifestError,
+    load_gguf_model_manifest,
+    load_llama_runtime_manifest,
+)
+from academic_chatbot.generation.llama_cpp import (
+    GenerationRuntimeUnavailable,
+    Phase0VerifiedSessionRunner,
+    VerifiedLlamaCppModel,
+)
+from academic_chatbot.generation.models import (
+    LocalGenerationFailed,
+    LocalGenerationFailureCode,
+    LocalGenerationRejected,
+    LocalGenerationRejectionCode,
+    LocalGenerationResult,
+)
+from academic_chatbot.generation.orchestrator import SinglePaperAskService
+from academic_chatbot.generation.service import LocalGenerationService
 from academic_chatbot.library.repository import ProjectRepository
 from academic_chatbot.library.service import LibraryService
+from academic_chatbot.ports.model import (
+    CancellationSignal,
+    StructuredGenerationRequest,
+    StructuredGenerationResult,
+)
 from academic_chatbot.retrieval.fts import RetrievalQueryError
+from academic_chatbot.retrieval.hybrid_models import HybridRetrievalResults
 from academic_chatbot.retrieval.hybrid_service import (
     HybridRetrievalIntegrityError,
     HybridRetrievalService,
@@ -64,10 +89,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run local commands and return a clean non-zero code for ordinary errors."""
 
     tokens = list(sys.argv[1:] if argv is None else argv)
-    parser = _parser(preview_errors=_is_evidence_invocation(tokens))
+    evidence_invocation = _is_evidence_invocation(tokens)
+    ask_invocation = _is_ask_invocation(tokens)
+    parser = _parser(preview_errors=evidence_invocation or ask_invocation)
     try:
         arguments = parser.parse_args(tokens)
     except EvidencePreparationError as error:
+        if ask_invocation:
+            return _write_generation_result(
+                LocalGenerationRejected(code=LocalGenerationRejectionCode.INVALID_REQUEST)
+            )
         return _write_evidence_error(error.error)
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2
@@ -75,6 +106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _dispatch_evidence_preview(arguments)
     if arguments.command == "evidence-group":
         return _dispatch_evidence_group_preview(arguments)
+    if arguments.command == "ask":
+        return _dispatch_ask(arguments)
     try:
         if arguments.max_pdf_bytes <= 0:
             raise ValueError("--max-pdf-bytes must be positive")
@@ -114,6 +147,14 @@ def _is_evidence_invocation(tokens: Sequence[str]) -> bool:
     This preliminary grammar deliberately omits validation and required flags:
     the full parser owns both, including malformed preview global arguments.
     """
+    return _root_command(tokens) in {"evidence-bundle", "evidence-group"}
+
+
+def _is_ask_invocation(tokens: Sequence[str]) -> bool:
+    return _root_command(tokens) == "ask"
+
+
+def _root_command(tokens: Sequence[str]) -> str | None:
     probe = _EvidenceArgumentParser(add_help=False)
     probe.add_argument("--data-root")
     probe.add_argument("--max-pdf-bytes")
@@ -122,8 +163,25 @@ def _is_evidence_invocation(tokens: Sequence[str]) -> bool:
     try:
         namespace, _ = probe.parse_known_args(tokens)
     except EvidencePreparationError:
-        return False
-    return bool(namespace.command in {"evidence-bundle", "evidence-group"})
+        return None
+    return namespace.command if isinstance(namespace.command, str) else None
+
+
+class _StoreOnce(argparse.Action):
+    """Reject repeated sensitive path options without echoing their values."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error("option may be supplied only once")
+        if not isinstance(values, str):
+            parser.error("option requires exactly one value")
+        setattr(namespace, self.dest, values)
 
 
 def _write_evidence_error(error: EvidenceBundleError) -> int:
@@ -207,6 +265,197 @@ def _dispatch_evidence_group_preview(arguments: argparse.Namespace) -> int:
     return 3 if bundle.state is PreviewState.INSUFFICIENT_EVIDENCE else 0
 
 
+def _write_generation_result(result: LocalGenerationResult) -> int:
+    sys.stdout.buffer.write(
+        canonical_evidence_json(result.model_dump(mode="json")) + b"\n"
+    )
+    sys.stdout.buffer.flush()
+    if result.outcome == "answered":
+        return 0
+    if result.outcome == "abstained":
+        return 3
+    return 2
+
+
+def _dispatch_ask(arguments: argparse.Namespace) -> int:
+    path_values = (
+        arguments.embedding_model_root,
+        arguments.runtime_dir,
+        arguments.runtime_manifest,
+        arguments.model,
+        arguments.model_manifest,
+    )
+    try:
+        valid_question = bool(arguments.question.strip()) and len(
+            arguments.question.encode("utf-8")
+        ) <= 4096
+    except (AttributeError, UnicodeEncodeError):
+        valid_question = False
+    if (
+        arguments.max_pdf_bytes <= 0
+        or not arguments.project_id.strip()
+        or not arguments.paper_id.strip()
+        or not valid_question
+        or any(not Path(value).is_absolute() for value in path_values)
+    ):
+        return _write_generation_result(
+            LocalGenerationRejected(code=LocalGenerationRejectionCode.INVALID_REQUEST)
+        )
+    try:
+        service = _build_ask_service(arguments)
+    except (
+        EmbeddingArtifactError,
+        EmbeddingPersistenceError,
+        OfflineEmbedderError,
+        SemanticArtifactIntegrityError,
+        SemanticIndexStaleError,
+        SemanticIndexUnavailableError,
+        SemanticProfileError,
+    ):
+        return _write_generation_result(
+            LocalGenerationFailed(code=LocalGenerationFailureCode.AUTHORITY_UNAVAILABLE)
+        )
+    except (
+        GenerationRuntimeUnavailable,
+        LlamaSliceManifestError,
+        OSError,
+    ):
+        return _write_generation_result(
+            LocalGenerationFailed(code=LocalGenerationFailureCode.RUNTIME_UNAVAILABLE)
+        )
+    except ValueError:
+        return _write_generation_result(
+            LocalGenerationRejected(code=LocalGenerationRejectionCode.INVALID_REQUEST)
+        )
+    except Exception:
+        return _write_generation_result(
+            LocalGenerationFailed(
+                code=LocalGenerationFailureCode.INTERNAL_INVARIANT_FAILURE
+            )
+        )
+    try:
+        result = service.ask(
+            project_id=arguments.project_id,
+            paper_id=arguments.paper_id,
+            question=arguments.question,
+        )
+    except Exception:
+        result = LocalGenerationFailed(
+            code=LocalGenerationFailureCode.INTERNAL_INVARIANT_FAILURE
+        )
+    return _write_generation_result(result)
+
+
+def _build_ask_service(arguments: argparse.Namespace) -> SinglePaperAskService:
+    data_root = Path(arguments.data_root)
+    paths = ProjectPaths.create(data_root, project_id=arguments.project_id)
+    resolver = EvidenceReadResolver(data_root=data_root)
+
+    def current_vector_generation_id() -> str:
+        vector_generation = EmbeddingRepository(paths).active_generation(
+            project_id=arguments.project_id,
+            embedding_profile_id=arguments.embedding_profile_id,
+        )
+        if vector_generation is None:
+            raise SemanticIndexUnavailableError("semantic index is unavailable")
+        return vector_generation.vector_generation_id
+
+    return SinglePaperAskService(
+        repository=ProjectRepository(paths),
+        retrieval=_LazyHybridRetrieval(
+            data_root=data_root,
+            project_id=arguments.project_id,
+            profile_id=arguments.embedding_profile_id,
+            model_root=Path(arguments.embedding_model_root),
+        ),
+        evidence=EvidenceBundleService(resolver=resolver),
+        generation=LocalGenerationService(
+            resolver=resolver,
+            model=_LazyVerifiedLlamaCppModel(
+                runtime_directory=Path(arguments.runtime_dir),
+                runtime_manifest_path=Path(arguments.runtime_manifest),
+                model_path=Path(arguments.model),
+                model_manifest_path=Path(arguments.model_manifest),
+            ),
+        ),
+        embedding_profile_id=arguments.embedding_profile_id,
+        vector_generation_id=current_vector_generation_id,
+    )
+
+
+class _LazyHybridRetrieval:
+    """Open embedding artifacts only after the selected source is admitted."""
+
+    def __init__(
+        self,
+        *,
+        data_root: Path,
+        project_id: str,
+        profile_id: str,
+        model_root: Path,
+    ) -> None:
+        self._data_root = data_root
+        self._project_id = project_id
+        self._profile_id = profile_id
+        self._model_root = model_root
+
+    def search(
+        self, project: Project, query: str, limit: int = 10
+    ) -> HybridRetrievalResults:
+        if project.project_id != self._project_id:
+            raise HybridRetrievalIntegrityError("project scope changed")
+        return HybridRetrievalService.open_from_model_root(
+            data_root=self._data_root,
+            project_id=self._project_id,
+            profile_id=self._profile_id,
+            model_root=self._model_root,
+        ).search(project, query, limit=limit)
+
+
+class _LazyVerifiedLlamaCppModel:
+    """Load pinned generation artifacts only after preview readiness succeeds."""
+
+    def __init__(
+        self,
+        *,
+        runtime_directory: Path,
+        runtime_manifest_path: Path,
+        model_path: Path,
+        model_manifest_path: Path,
+    ) -> None:
+        self._runtime_directory = runtime_directory
+        self._runtime_manifest_path = runtime_manifest_path
+        self._model_path = model_path
+        self._model_manifest_path = model_manifest_path
+
+    def generate(
+        self,
+        request: StructuredGenerationRequest,
+        *,
+        cancel: CancellationSignal,
+    ) -> StructuredGenerationResult:
+        try:
+            runtime_manifest = load_llama_runtime_manifest(
+                self._runtime_manifest_path
+            )
+            model_manifest = load_gguf_model_manifest(self._model_manifest_path)
+            model = VerifiedLlamaCppModel(
+                runner=Phase0VerifiedSessionRunner(
+                    runtime_directory=self._runtime_directory,
+                    runtime_manifest=runtime_manifest,
+                    model_path=self._model_path,
+                    model_manifest=model_manifest,
+                ),
+                runtime_manifest=runtime_manifest,
+                model_manifest=model_manifest,
+            )
+            return model.generate(request, cancel=cancel)
+        except GenerationRuntimeUnavailable:
+            raise
+        except (LlamaSliceManifestError, OSError, ValueError):
+            raise GenerationRuntimeUnavailable from None
+
+
 def _parser(*, preview_errors: bool = False) -> argparse.ArgumentParser:
     parser_type = _EvidenceArgumentParser if preview_errors else argparse.ArgumentParser
     parser = parser_type(prog="academic_chatbot")
@@ -248,6 +497,16 @@ def _parser(*, preview_errors: bool = False) -> argparse.ArgumentParser:
     search.add_argument("--mode", choices=("lexical", "semantic", "hybrid"), default="lexical")
     search.add_argument("--embedding-profile-id")
     search.add_argument("--model-root")
+    ask = commands.add_parser("ask")
+    ask.add_argument("--project-id", required=True)
+    ask.add_argument("--paper-id", required=True)
+    ask.add_argument("--question", required=True)
+    ask.add_argument("--embedding-profile-id", required=True)
+    ask.add_argument("--embedding-model-root", required=True, action=_StoreOnce)
+    ask.add_argument("--runtime-dir", required=True, action=_StoreOnce)
+    ask.add_argument("--runtime-manifest", required=True, action=_StoreOnce)
+    ask.add_argument("--model", required=True, action=_StoreOnce)
+    ask.add_argument("--model-manifest", required=True, action=_StoreOnce)
     return parser
 
 

@@ -6,6 +6,7 @@ import hashlib
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
@@ -34,6 +35,24 @@ class UnknownPaperError(ValueError):
 
 class DocumentGenerationPublicationError(ValueError):
     """Raised when an immutable document generation cannot be published safely."""
+
+
+class PaperSourceNotCurrentError(ValueError):
+    """Raised when a selected paper has no published current source."""
+
+
+class PaperSourceAmbiguousError(ValueError):
+    """Raised when a selected paper has more than one published FileVersion."""
+
+
+@dataclass(frozen=True)
+class CurrentPaperSource:
+    """The sole published source scope admitted for one explicit paper."""
+
+    project_id: str
+    paper_id: str
+    file_version_id: str
+    document_generation_id: str
 
 
 def _timestamp() -> str:
@@ -80,6 +99,49 @@ class ProjectRepository:
         if not self.paper_exists(paper_id, project_id):
             message = f"paper {paper_id} does not belong to project {project_id}"
             raise UnknownPaperError(message)
+
+    def sole_current_paper_source(
+        self, *, project_id: str, paper_id: str
+    ) -> CurrentPaperSource:
+        """Return exactly one published FileVersion without guessing a latest source."""
+
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                paper = connection.execute(
+                    "SELECT 1 FROM papers WHERE paper_id = ? AND project_id = ?",
+                    (paper_id, project_id),
+                ).fetchone()
+                if paper is None:
+                    raise UnknownPaperError("selected paper does not exist")
+                rows = connection.execute(
+                    """
+                    SELECT fv.file_version_id, gp.document_generation_id
+                    FROM file_versions AS fv
+                    JOIN papers AS p ON p.paper_id = fv.paper_id
+                    JOIN generation_publications AS gp
+                      ON gp.file_version_id = fv.file_version_id
+                    JOIN document_generations AS dg
+                      ON dg.document_generation_id = gp.document_generation_id
+                     AND dg.file_version_id = fv.file_version_id
+                    WHERE p.project_id = ? AND p.paper_id = ?
+                    ORDER BY fv.file_version_id, gp.document_generation_id
+                    LIMIT 2
+                    """,
+                    (project_id, paper_id),
+                ).fetchall()
+            finally:
+                connection.rollback()
+        if not rows:
+            raise PaperSourceNotCurrentError("selected paper has no current source")
+        if len(rows) != 1:
+            raise PaperSourceAmbiguousError("selected paper source is ambiguous")
+        return CurrentPaperSource(
+            project_id=project_id,
+            paper_id=paper_id,
+            file_version_id=str(rows[0][0]),
+            document_generation_id=str(rows[0][1]),
+        )
 
     def register_file_version(self, *, file_version: FileVersion) -> FileVersion:
         with self._connection() as connection, immediate_transaction(connection):

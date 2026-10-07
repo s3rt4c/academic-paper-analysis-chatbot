@@ -24,6 +24,7 @@ from academic_chatbot.generation.models import (
     LocalGenerationResult,
     MvpCitedAnswer,
 )
+from academic_chatbot.generation.orchestrator import SinglePaperAskService
 from academic_chatbot.generation.service import LocalGenerationService
 
 __all__ = [
@@ -47,5 +48,6 @@ __all__ = [
     "LocalGenerationService",
     "MvpCitedAnswer",
     "RenderedGenerationContext",
+    "SinglePaperAskService",
     "render_generation_context",
 ]
