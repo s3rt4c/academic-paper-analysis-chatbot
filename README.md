@@ -32,6 +32,12 @@ decisions. The supported-objective verifier accepts only caller-asserted
 `SupportedProposal` values, requires exact UTF-8 equality for every standalone
 citation, and abstains from scalar projection for `EvidenceGroup` values.
 
+**MVP — bounded local generation and single-paper ask: implemented.** The local
+`ask` CLI connects retrieval and authoritative evidence preparation to the frozen
+`llama.cpp` generation profile. Offline validation and opt-in live Windows
+acceptance from this public checkout are recorded in
+[the MVP validation record](docs/mvp-validation.md).
+
 ## What Phase 0 validates
 
 - Reproducible Python packaging and strict test/tool configuration.
@@ -116,6 +122,28 @@ boundary is recorded in
 The acceptance record does not claim evidence completeness, retrieval recall,
 support classification, or generation readiness.
 
+## What the implemented MVP provides
+
+- One explicitly selected paper and one question through the local `ask` CLI.
+- Existing hybrid retrieval followed by an authoritative EvidenceBundle and
+  trusted/untrusted context rendering.
+- Exact template rendering and tokenizer admission on the same verified local
+  `llama.cpp` session: a 4096-token context with 1024 tokens reserved for output.
+- Strict structured output, validated citation labels and source locations,
+  and currentness rechecks before releasing an answer.
+- Frozen local Qwen3 generation with loopback-only transport; external model
+  artifacts are provisioned separately and are not committed or downloaded by
+  the application.
+- Ordinary offline CI with synthetic fixtures and fake model behavior, without
+  external BGE, GGUF, or runtime artifacts.
+- An opt-in Windows test exercising real BGE retrieval and local generation.
+
+Citation validation does not establish semantic entailment or factual
+correctness. Multi-paper synthesis, a UI/API, OCR execution, automatic
+five-status classification, and general production readiness remain outside
+this frozen MVP. See [the validation record](docs/mvp-validation.md) for the
+measured scope and limitations.
+
 ## Architecture direction
 
 The planned system is a local RAG research assistant with PDF ingestion, extraction/OCR, section-aware chunking, FTS plus dense retrieval, evidence spans, citation verification, staged deep analysis, SQLite-backed local state, and a resource governor. See [docs/architecture.md](docs/architecture.md) for the public design summary.
@@ -163,6 +191,7 @@ tools/                Documentation and fixture support tools
 - **Phase 1B — Native-text semantic retrieval foundation:** complete
 - **Phase 1C — Deterministic hybrid retrieval:** complete; publication review pending
 - **Phase 2 — Evidence preparation and supported-objective exact-text verification:** bounded public slice implemented; broader deep analysis and Evidence Chat remain future work
+- **MVP — Bounded local generation and single-paper ask:** implemented; broader workflows remain future work
 - **Phase 3 — Academic discovery:** planned
 - **Phase 4 — Packaging and hardening:** planned
 
@@ -198,8 +227,9 @@ tools/                Documentation and fixture support tools
   conflict, or unreadable decision engine exists.
 - Evidence completeness and retrieval recall are not guaranteed. Retrieval
   absence must not be interpreted as `not_reported`.
-- Generation remains disabled. Tokenizer/model-facing answer generation and
-  production `llama.cpp` answer generation are not implemented.
+- Local answer generation is limited to the frozen single-paper MVP. It does
+  not provide multi-paper synthesis, semantic-entailment verification, or
+  automatic five-status analysis.
 
 ## Development setup
 
@@ -216,11 +246,11 @@ py -3.12 -m venv .venv
 Run the non-live baseline checks:
 
 ```powershell
-.venv\Scripts\python.exe -m pytest tests/unit -q
-.venv\Scripts\python.exe -m pytest tests/contract -q
-.venv\Scripts\python.exe -m pytest tests/integration -q
-.venv\Scripts\python.exe -m pytest tests/e2e -q
-.venv\Scripts\python.exe -m pytest tests/security -q
+.venv\Scripts\python.exe -m pytest tests/unit -q --import-mode=importlib
+.venv\Scripts\python.exe -m pytest tests/contract -q --import-mode=importlib
+.venv\Scripts\python.exe -m pytest tests/integration -q --import-mode=importlib
+.venv\Scripts\python.exe -m pytest tests/e2e -q --import-mode=importlib
+.venv\Scripts\python.exe -m pytest tests/security -q --import-mode=importlib
 .venv\Scripts\python.exe -m ruff check src tests
 .venv\Scripts\python.exe -m mypy src
 .venv\Scripts\python.exe -m pip check
