@@ -10,7 +10,10 @@ import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalRequest, SemanticIdentity
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -151,17 +154,35 @@ class SemanticRetrievalService:
     ) -> None:
         if embedder.profile != profile:
             raise SemanticProfileError("query embedder must use the requested embedding profile")
+        self._scoped_data_root = Path(data_root)
         self._data_root = Path(data_root).resolve(strict=False)
         self.profile = profile
         self._embedder = embedder
+        # A model-registration trust binding, never a cached publication identity.
+        # The verified factory binds immediately; injected embedders bind at admission.
+        self._scoped_artifact_manifest_sha256: str | None = None
 
     @classmethod
     def open_from_model_root(
-        cls, *, data_root: Path, project_id: str, profile_id: str, model_root: Path
+        cls,
+        *,
+        data_root: Path,
+        project_id: str,
+        profile_id: str,
+        model_root: Path,
+        scoped: bool = False,
     ) -> SemanticRetrievalService:
-        paths = ProjectPaths.create(data_root, project_id=project_id)
+        max_profile_bytes = None
+        if scoped:
+            from academic_chatbot.evidence.models import MAX_PROFILE_BYTES
+            from academic_chatbot.library.repository import guard_scoped_database
+
+            paths = guard_scoped_database(data_root, project_id)
+            max_profile_bytes = MAX_PROFILE_BYTES
+        else:
+            paths = ProjectPaths.create(data_root, project_id=project_id)
         profile, registered_manifest_sha256 = _load_registered_profile_with_manifest_hash(
-            paths, profile_id
+            paths, profile_id, max_profile_bytes=max_profile_bytes
         )
         try:
             artifacts = load_verified_artifacts(model_root, profile=profile)
@@ -177,7 +198,293 @@ class SemanticRetrievalService:
             raise SemanticProfileError(
                 "verified local embedding artifact is unavailable"
             ) from error
-        return cls(data_root=data_root, profile=profile, embedder=embedder)
+        service = cls(data_root=data_root, profile=profile, embedder=embedder)
+        service._scoped_artifact_manifest_sha256 = registered_manifest_sha256
+        return service
+
+    def current_identity(self, *, project_id: str) -> SemanticIdentity:
+        """Fresh read-only registered profile and whole-project publication identity."""
+        from academic_chatbot.library.repository import guard_scoped_database
+        from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+        paths = guard_scoped_database(self._scoped_data_root, project_id)
+        try:
+            connection = open_read_only_connection(paths.database_path, data_root=self._data_root)
+        except (DatabasePathError, OSError):
+            raise ScopedRetrievalError("STORAGE_UNAVAILABLE") from None
+        try:
+            connection.execute("BEGIN")
+            return self._scoped_authority(connection, project_id)[1]
+        except sqlite3.DatabaseError:
+            raise ScopedRetrievalError("VECTOR_INTEGRITY") from None
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _scoped_authority(
+        self,
+        connection: sqlite3.Connection,
+        project_id: str,
+    ) -> tuple[_Generation, SemanticIdentity]:
+        from academic_chatbot.evidence.models import MAX_PROFILE_BYTES, MAX_SOURCE_SNAPSHOT_ROWS
+        from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError, SemanticIdentity
+
+        bound = connection.execute(
+            """SELECT length(CAST(canonical_profile_json AS BLOB))
+               FROM embedding_profiles WHERE embedding_profile_id=?""",
+            (self.profile.embedding_profile_id,),
+        ).fetchone()
+        if bound is None:
+            raise ScopedRetrievalError("VECTOR_UNAVAILABLE")
+        if bound[0] > MAX_PROFILE_BYTES:
+            raise ScopedRetrievalError("RESOURCE_LIMIT")
+        row = connection.execute(
+            """SELECT canonical_profile_json, canonical_profile_sha256, artifact_manifest_sha256
+               FROM embedding_profiles WHERE embedding_profile_id=?""",
+            (self.profile.embedding_profile_id,),
+        ).fetchone()
+        try:
+            persisted = EmbeddingProfile.model_validate(json.loads(row[0]))
+            if (
+                persisted != self.profile
+                or hashlib.sha256(row[0].encode("utf-8")).hexdigest() != row[1]
+                or not isinstance(row[2], str)
+                or len(row[2]) != 64
+                or any(c not in "0123456789abcdef" for c in row[2])
+                or (
+                    self._scoped_artifact_manifest_sha256 is not None
+                    and row[2] != self._scoped_artifact_manifest_sha256
+                )
+            ):
+                raise ScopedRetrievalError("PROFILE_MISMATCH")
+            generation = _active_generation(connection, project_id=project_id, profile=self.profile)
+            sources, snapshot = _current_snapshot(
+                connection,
+                project_id=project_id,
+                embedding_profile_id=self.profile.embedding_profile_id,
+                max_rows=MAX_SOURCE_SNAPSHOT_ROWS,
+            )
+            if snapshot != generation.source_snapshot_sha256 or sources != _generation_sources(
+                connection, generation.vector_generation_id, max_rows=MAX_SOURCE_SNAPSHOT_ROWS
+            ):
+                raise ScopedRetrievalError("VECTOR_NOT_CURRENT")
+            identity = SemanticIdentity(
+                embedding_profile_id=self.profile.embedding_profile_id,
+                embedding_profile_sha256=row[1],
+                vector_generation_id=generation.vector_generation_id,
+                source_snapshot_sha256=generation.source_snapshot_sha256,
+                vector_store_manifest_sha256=generation.vector_store_manifest_sha256,
+            )
+            if self._scoped_artifact_manifest_sha256 is None:
+                self._scoped_artifact_manifest_sha256 = row[2]
+            return generation, identity
+        except SemanticIndexUnavailableError:
+            raise ScopedRetrievalError("VECTOR_UNAVAILABLE") from None
+        except (SemanticRetrievalIntegrityError, ValidationError, ValueError) as error:
+            if isinstance(error, ScopedRetrievalError):
+                raise
+            raise ScopedRetrievalError("VECTOR_INTEGRITY") from None
+
+    def search_scoped(self, request: ScopedRetrievalRequest) -> SemanticRetrievalResults:
+        """Validate ALL bounded mapping lineage, then compete only eligible global rows."""
+        from academic_chatbot.evidence.models import (
+            MAX_MANIFEST_BYTES,
+            MAX_RESOLVED_TEXT_BYTES,
+            MAX_VECTOR_FILE_BYTES,
+            MAX_VECTOR_METADATA_BYTES,
+            MAX_VECTOR_ROWS,
+        )
+        from academic_chatbot.library.repository import guard_scoped_database
+        from academic_chatbot.retrieval.exact_memmap import VectorOpenLimitError, VectorOpenLimits
+        from academic_chatbot.retrieval.scoped_models import (
+            ScopedRetrievalError,
+            ScopedRetrievalRequest,
+            validate_hit_scope,
+        )
+        from academic_chatbot.retrieval.service import preflight_scoped_evidence
+
+        try:
+            request = ScopedRetrievalRequest.model_validate(request)
+        except ValidationError:
+            raise ScopedRetrievalError("INVALID_REQUEST") from None
+        if request.mode != "semantic" or request.semantic_identity is None:
+            raise ScopedRetrievalError("INVALID_REQUEST")
+        paths = guard_scoped_database(self._scoped_data_root, request.scope.project_id)
+        try:
+            connection = open_read_only_connection(paths.database_path, data_root=self._data_root)
+        except (DatabasePathError, OSError):
+            raise ScopedRetrievalError("STORAGE_UNAVAILABLE") from None
+        try:
+            connection.execute("BEGIN")
+            generation, identity = self._scoped_authority(connection, request.scope.project_id)
+            if identity != request.semantic_identity:
+                raise ScopedRetrievalError("VECTOR_NOT_CURRENT")
+            mapping = _mapping(
+                connection, generation.vector_generation_id, max_rows=MAX_VECTOR_ROWS
+            )
+            if (
+                generation.embeddable_spans != len(mapping)
+                or tuple(row for row, _ in mapping) != tuple(range(len(mapping)))
+                or len({span for _, span in mapping}) != len(mapping)
+            ):
+                raise ScopedRetrievalError("VECTOR_INTEGRITY")
+            lineage = connection.execute(
+                """SELECT m.vector_row, m.embedding_span_id, span.embedding_profile_id,
+                          span.coverage_status, span.document_generation_id,
+                          span.page_id, span.chunk_id, chunk.document_generation_id AS chunk_gen,
+                          chunk.page_id AS chunk_page, page.document_generation_id AS page_gen,
+                          dg.file_version_id, fv.paper_id, paper.project_id, project.project_id AS owner,
+                          source.file_version_id AS source_fv,
+                          source.document_generation_id AS source_gen,
+                          active.document_generation_id AS active_gen,
+                          span.start_offset, span.end_offset
+                   FROM vector_generation_spans m
+                   LEFT JOIN embedding_spans span ON span.embedding_span_id=m.embedding_span_id
+                   LEFT JOIN chunks chunk ON chunk.chunk_id=span.chunk_id
+                   LEFT JOIN pages page ON page.page_id=span.page_id
+                   LEFT JOIN document_generations dg
+                     ON dg.document_generation_id=span.document_generation_id
+                   LEFT JOIN file_versions fv ON fv.file_version_id=dg.file_version_id
+                   LEFT JOIN papers paper ON paper.paper_id=fv.paper_id
+                   LEFT JOIN projects project ON project.project_id=paper.project_id
+                   LEFT JOIN vector_generation_sources source
+                     ON source.vector_generation_id=m.vector_generation_id
+                    AND source.document_generation_id=span.document_generation_id
+                   LEFT JOIN generation_publications active
+                     ON active.file_version_id=fv.file_version_id
+                   WHERE m.vector_generation_id=? ORDER BY m.vector_row LIMIT ?""",
+                (generation.vector_generation_id, MAX_VECTOR_ROWS + 1),
+            ).fetchall()
+            if len(lineage) != len(mapping):
+                raise ScopedRetrievalError("VECTOR_INTEGRITY")
+            eligible = []
+            by_row = {}
+            for row, pair in zip(lineage, mapping, strict=True):
+                if (
+                    (row["vector_row"], row["embedding_span_id"]) != pair
+                    or row["embedding_profile_id"] != self.profile.embedding_profile_id
+                    or row["coverage_status"] != "EMBEDDABLE"
+                    or row["project_id"] != request.scope.project_id
+                    or row["owner"] != request.scope.project_id
+                    or row["document_generation_id"] is None
+                    or not row["document_generation_id"]
+                    == row["chunk_gen"]
+                    == row["page_gen"]
+                    == row["source_gen"]
+                    == row["active_gen"]
+                    or row["chunk_page"] != row["page_id"]
+                    or row["file_version_id"] is None
+                    or row["file_version_id"] != row["source_fv"]
+                ):
+                    raise ScopedRetrievalError("VECTOR_INTEGRITY")
+                if (
+                    row["paper_id"] == request.scope.paper_id
+                    and row["file_version_id"] == request.scope.file_version_id
+                    and row["document_generation_id"] == request.scope.document_generation_id
+                ):
+                    eligible.append(row["vector_row"])
+                by_row[row["vector_row"]] = row
+            artifact = _artifact_path(
+                paths,
+                generation.artifact_relative_dir,
+                profile_id=generation.embedding_profile_id,
+                source_snapshot_sha256=generation.source_snapshot_sha256,
+            )
+            if not artifact.is_dir():
+                raise ScopedRetrievalError("VECTOR_UNAVAILABLE")
+            empty = artifact / "empty-generation.json"
+            if empty.exists():
+                _require_ordinary_artifact_files(artifact, empty=True)
+                if mapping or generation.embeddable_spans != 0:
+                    raise ScopedRetrievalError("VECTOR_INTEGRITY")
+                if empty.stat().st_size > MAX_MANIFEST_BYTES:
+                    raise ScopedRetrievalError("RESOURCE_LIMIT")
+                _verify_empty_artifact(
+                    artifact,
+                    expected_manifest_sha256=generation.vector_store_manifest_sha256,
+                    profile_sha256=_profile_sha256(self.profile),
+                    source_snapshot_sha256=generation.source_snapshot_sha256,
+                )
+                hits: tuple[SemanticRetrievalHit, ...] = ()
+            else:
+                if any(
+                    not (artifact / name).exists()
+                    for name in ("manifest.json", "vectors.meta.json", "vectors.npy")
+                ):
+                    raise ScopedRetrievalError("VECTOR_UNAVAILABLE")
+                _require_ordinary_artifact_files(artifact, empty=False)
+                limits = VectorOpenLimits(
+                    max_manifest_bytes=MAX_MANIFEST_BYTES,
+                    max_metadata_bytes=MAX_VECTOR_METADATA_BYTES,
+                    max_vectors_file_bytes=MAX_VECTOR_FILE_BYTES,
+                    max_rows=MAX_VECTOR_ROWS,
+                    expected_dimension=self.profile.dimension,
+                )
+                with ExactVectorStore.open(artifact, limits=limits) as store:
+                    if (
+                        store.manifest.manifest_sha256 != generation.vector_store_manifest_sha256
+                        or store.manifest.profile_sha256 != _profile_sha256(self.profile)
+                        or store.manifest.dimension != self.profile.dimension
+                        or tuple(store.row_ids) != tuple(span for _, span in mapping)
+                    ):
+                        raise ScopedRetrievalError("VECTOR_INTEGRITY")
+                    selected = store.search_eligible(
+                        self._embed_query(request.query),
+                        eligible_rows=tuple(eligible),
+                        limit=request.limit,
+                        block_rows=4096,
+                    )
+                    total = 0
+                    for selected_row in selected:
+                        row = by_row[selected_row.vector_row]
+                        total += preflight_scoped_evidence(
+                            connection,
+                            page_id=row["page_id"],
+                            chunk_id=row["chunk_id"],
+                            start=row["start_offset"],
+                            end=row["end_offset"],
+                        )
+                    if total > MAX_RESOLVED_TEXT_BYTES:
+                        raise ScopedRetrievalError("RESOURCE_LIMIT")
+                    hits = tuple(
+                        _semantic_hit(
+                            connection=connection,
+                            project_id=request.scope.project_id,
+                            generation=generation,
+                            profile=self.profile,
+                            vector_hit=hit,
+                            rank=rank,
+                        )
+                        for rank, hit in enumerate(selected, 1)
+                    )
+            for hit in hits:
+                validate_hit_scope(hit, request.scope, identity)
+            return SemanticRetrievalResults(
+                project_id=request.scope.project_id,
+                query=request.query,
+                embedding_profile_id=identity.embedding_profile_id,
+                vector_generation_id=identity.vector_generation_id,
+                hits=hits,
+            )
+        except VectorOpenLimitError:
+            raise ScopedRetrievalError("RESOURCE_LIMIT") from None
+        except SemanticQueryError:
+            raise ScopedRetrievalError("INVALID_REQUEST") from None
+        except SemanticProfileError:
+            raise ScopedRetrievalError("PROFILE_MISMATCH") from None
+        except (
+            sqlite3.DatabaseError,
+            SemanticArtifactIntegrityError,
+            SemanticRetrievalIntegrityError,
+            OSError,
+            ValueError,
+        ) as error:
+            if isinstance(error, ScopedRetrievalError):
+                raise
+            raise ScopedRetrievalError("VECTOR_INTEGRITY") from None
+        finally:
+            connection.rollback()
+            connection.close()
 
     def search(
         self,
@@ -455,11 +762,24 @@ class SemanticRetrievalService:
 
 
 def _load_registered_profile_with_manifest_hash(
-    paths: ProjectPaths, profile_id: str
+    paths: ProjectPaths, profile_id: str, *, max_profile_bytes: int | None = None
 ) -> tuple[EmbeddingProfile, str]:
     validate_embedding_profile_id(profile_id)
     connection = open_read_only_connection(paths.database_path, data_root=paths.data_root)
     try:
+        if max_profile_bytes is not None:
+            from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+            connection.execute("BEGIN")
+            bound = connection.execute(
+                "SELECT length(CAST(canonical_profile_json AS BLOB)) FROM embedding_profiles "
+                "WHERE embedding_profile_id=?",
+                (profile_id,),
+            ).fetchone()
+            if bound is None:
+                raise ScopedRetrievalError("VECTOR_UNAVAILABLE")
+            if bound[0] > max_profile_bytes:
+                raise ScopedRetrievalError("RESOURCE_LIMIT")
         row = connection.execute(
             """SELECT canonical_profile_json, canonical_profile_sha256, artifact_manifest_sha256
             FROM embedding_profiles WHERE embedding_profile_id = ?""",
@@ -481,7 +801,10 @@ def _load_registered_profile_with_manifest_hash(
     if hashlib.sha256(raw_profile).hexdigest() != str(row[1]):
         raise SemanticProfileError("persisted embedding profile content hash is invalid")
     registered_manifest_sha256 = str(row[2])
-    if len(registered_manifest_sha256) != 64:
+    if len(registered_manifest_sha256) != 64 or (
+        max_profile_bytes is not None
+        and any(c not in "0123456789abcdef" for c in registered_manifest_sha256)
+    ):
         raise SemanticProfileError("persisted embedding artifact manifest hash is invalid")
     return profile, registered_manifest_sha256
 
@@ -516,7 +839,11 @@ def _active_generation(
 
 
 def _current_snapshot(
-    connection: sqlite3.Connection, *, project_id: str, embedding_profile_id: str
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    embedding_profile_id: str,
+    max_rows: int | None = None,
 ) -> tuple[tuple[_Source, ...], str]:
     rows = connection.execute(
         """SELECT fv.file_version_id, active.document_generation_id,
@@ -526,9 +853,11 @@ def _current_snapshot(
         LEFT JOIN pages ON pages.document_generation_id = active.document_generation_id
         LEFT JOIN chunks ON chunks.document_generation_id = active.document_generation_id
         WHERE paper.project_id = ? GROUP BY fv.file_version_id, active.document_generation_id
-        ORDER BY fv.file_version_id, active.document_generation_id""",
-        (project_id,),
+        ORDER BY fv.file_version_id, active.document_generation_id"""
+        + (" LIMIT ?" if max_rows is not None else ""),
+        (project_id, max_rows + 1) if max_rows is not None else (project_id,),
     ).fetchall()
+    _scoped_row_bound(rows, max_rows)
     sources = tuple(_Source(str(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in rows)
     payload = {
         "schema_version": "vector-source-snapshot-v1",
@@ -547,22 +876,30 @@ def _current_snapshot(
     return sources, hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
-def _generation_sources(connection: sqlite3.Connection, generation_id: str) -> tuple[_Source, ...]:
+def _generation_sources(
+    connection: sqlite3.Connection, generation_id: str, *, max_rows: int | None = None
+) -> tuple[_Source, ...]:
     rows = connection.execute(
         """SELECT file_version_id, document_generation_id, eligible_native_chunk_count, needs_ocr_page_count
         FROM vector_generation_sources WHERE vector_generation_id = ?
-        ORDER BY file_version_id, document_generation_id""",
-        (generation_id,),
+        ORDER BY file_version_id, document_generation_id"""
+        + (" LIMIT ?" if max_rows is not None else ""),
+        (generation_id, max_rows + 1) if max_rows is not None else (generation_id,),
     ).fetchall()
+    _scoped_row_bound(rows, max_rows)
     return tuple(_Source(str(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in rows)
 
 
-def _mapping(connection: sqlite3.Connection, generation_id: str) -> tuple[tuple[int, str], ...]:
+def _mapping(
+    connection: sqlite3.Connection, generation_id: str, *, max_rows: int | None = None
+) -> tuple[tuple[int, str], ...]:
     rows = connection.execute(
         """SELECT vector_row, embedding_span_id FROM vector_generation_spans
-        WHERE vector_generation_id = ? ORDER BY vector_row""",
-        (generation_id,),
+        WHERE vector_generation_id = ? ORDER BY vector_row"""
+        + (" LIMIT ?" if max_rows is not None else ""),
+        (generation_id, max_rows + 1) if max_rows is not None else (generation_id,),
     ).fetchall()
+    _scoped_row_bound(rows, max_rows)
     return tuple((int(row[0]), str(row[1])) for row in rows)
 
 
@@ -607,9 +944,7 @@ def _positioned_pages(
                 )
             )
     except (KeyError, TypeError, ValueError) as error:
-        raise SemanticPositionalAcquisitionError(
-            "positioned page metadata is malformed"
-        ) from error
+        raise SemanticPositionalAcquisitionError("positioned page metadata is malformed") from error
     if {page.document_generation_id for page in pages} != set(document_generation_ids):
         raise SemanticPositionalAcquisitionError(
             "positioned page metadata is missing for a semantic document"
@@ -780,3 +1115,10 @@ def _semantic_hit(
         )
     except (KeyError, TypeError, ValueError, ValidationError) as error:
         raise SemanticRetrievalIntegrityError("semantic evidence is malformed") from error
+
+
+def _scoped_row_bound(rows: Sequence[sqlite3.Row], maximum: int | None) -> None:
+    if maximum is not None and len(rows) > maximum:
+        from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+        raise ScopedRetrievalError("RESOURCE_LIMIT")

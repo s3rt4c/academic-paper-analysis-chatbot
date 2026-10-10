@@ -13,18 +13,23 @@ from academic_chatbot.retrieval import exact_memmap as vector
 @pytest.fixture
 def artifact(tmp_path):
     with vector.ExactVectorStore.build(
-        tmp_path, rows=np.array([[1, 0], [0, 1], [1, 0]], dtype=np.float32),
-        row_ids=("span-a", "span-b", "span-c"), profile_sha256="a" * 64,
+        tmp_path,
+        rows=np.array([[1, 0], [0, 1], [1, 0]], dtype=np.float32),
+        row_ids=("span-a", "span-b", "span-c"),
+        profile_sha256="a" * 64,
         normalization_atol=0.001,
     ) as store:
         return store.generation_dir
 
 
 def limits(path, **changes):
-    values = dict(max_manifest_bytes=(path / "manifest.json").stat().st_size,
-                  max_metadata_bytes=(path / "vectors.meta.json").stat().st_size,
-                  max_vectors_file_bytes=(path / "vectors.npy").stat().st_size,
-                  max_rows=3, expected_dimension=2)
+    values = dict(
+        max_manifest_bytes=(path / "manifest.json").stat().st_size,
+        max_metadata_bytes=(path / "vectors.meta.json").stat().st_size,
+        max_vectors_file_bytes=(path / "vectors.npy").stat().st_size,
+        max_rows=3,
+        expected_dimension=2,
+    )
     values.update(changes)
     return vector.VectorOpenLimits(**values)
 
@@ -59,8 +64,15 @@ def test_open_with_limits_rejects_actual_metadata_overflow(artifact, monkeypatch
         vector.ExactVectorStore.open(artifact, limits=bound)
 
 
-@pytest.mark.parametrize("change", [dict(max_rows=2), dict(expected_dimension=3),
-                                    dict(max_vectors_file_bytes=1), dict(max_metadata_bytes=1)])
+@pytest.mark.parametrize(
+    "change",
+    [
+        dict(max_rows=2),
+        dict(expected_dimension=3),
+        dict(max_vectors_file_bytes=1),
+        dict(max_metadata_bytes=1),
+    ],
+)
 def test_open_with_limits_rejects_shape_before_mapping(artifact, monkeypatch, change):
     bound = limits(artifact, **change)
     monkeypatch.setattr(vector.np, "memmap", forbidden)
@@ -89,8 +101,14 @@ def test_limited_and_default_open_return_identical_search_results(artifact, monk
             limited.search(np.array([1, 0], dtype=np.float32), limit=1, block_rows=1)
 
 
-@pytest.mark.parametrize("filename,field", [("manifest.json", "max_manifest_bytes"),
-    ("vectors.meta.json", "max_metadata_bytes"), ("vectors.npy", "max_vectors_file_bytes")])
+@pytest.mark.parametrize(
+    "filename,field",
+    [
+        ("manifest.json", "max_manifest_bytes"),
+        ("vectors.meta.json", "max_metadata_bytes"),
+        ("vectors.npy", "max_vectors_file_bytes"),
+    ],
+)
 def test_exact_fit_and_one_byte_overflow(artifact, filename, field):
     size = (artifact / filename).stat().st_size
     with vector.ExactVectorStore.open(artifact, limits=limits(artifact, **{field: size})):
@@ -99,8 +117,16 @@ def test_exact_fit_and_one_byte_overflow(artifact, filename, field):
         vector.ExactVectorStore.open(artifact, limits=limits(artifact, **{field: size - 1}))
 
 
-@pytest.mark.parametrize("field", ["max_manifest_bytes", "max_metadata_bytes",
-                                 "max_vectors_file_bytes", "max_rows", "expected_dimension"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_manifest_bytes",
+        "max_metadata_bytes",
+        "max_vectors_file_bytes",
+        "max_rows",
+        "expected_dimension",
+    ],
+)
 @pytest.mark.parametrize("value", [0, -1, True, False, 1.0, "1"])
 def test_limits_reject_boolean_and_nonpositive_values(artifact, field, value):
     with pytest.raises(ValueError):
@@ -124,8 +150,16 @@ def test_none_preserves_existing_open_path(monkeypatch, tmp_path):
     monkeypatch.setattr(vector.ExactVectorStore, "_open_verified", classmethod(verified))
     assert vector.ExactVectorStore.open(tmp_path) is sentinel
     assert vector.ExactVectorStore.open(tmp_path, limits=None) is sentinel
-    assert calls == [(tmp_path, dict(expected_manifest=None, require_generation_name=True,
-                                    require_manifest=True))] * 2
+    assert (
+        calls
+        == [
+            (
+                tmp_path,
+                dict(expected_manifest=None, require_generation_name=True, require_manifest=True),
+            )
+        ]
+        * 2
+    )
 
 
 @pytest.mark.parametrize("filename", ["manifest.json", "vectors.meta.json", "vectors.npy"])
@@ -236,15 +270,21 @@ def rewritten_artifact(artifact, vector_bytes):
     # Re-sign a tiny malformed payload so tests reach structural checks rather
     # than stopping at an unrelated digest mismatch. No production format changes.
     (artifact / "vectors.npy").write_bytes(vector_bytes)
-    manifest = vector._build_manifest(vectors_path=artifact / "vectors.npy",
-        metadata_path=artifact / "vectors.meta.json", row_count=3, dimension=2,
-        profile_sha256="a" * 64, normalization_atol=0.001)
+    manifest = vector._build_manifest(
+        vectors_path=artifact / "vectors.npy",
+        metadata_path=artifact / "vectors.meta.json",
+        row_count=3,
+        dimension=2,
+        profile_sha256="a" * 64,
+        normalization_atol=0.001,
+    )
     target = artifact.parent / manifest.generation_id
     target.mkdir(exist_ok=True)
     (target / "vectors.npy").write_bytes(vector_bytes)
     (target / "vectors.meta.json").write_bytes((artifact / "vectors.meta.json").read_bytes())
-    (target / "manifest.json").write_bytes(vector._canonical_json_file_bytes(
-        manifest.model_dump(mode="json")))
+    (target / "manifest.json").write_bytes(
+        vector._canonical_json_file_bytes(manifest.model_dump(mode="json"))
+    )
     return target
 
 
@@ -306,3 +346,81 @@ def test_header_extent_rejected_before_reading_past_verified_file():
     with pytest.raises(ValueError, match="extent"):
         vector._read_bounded_npy_header(stream, max_header_bytes=1000, file_bytes=20)
     assert stream.tell() == 12
+
+
+def test_scoped_exact_rows_starvation_boundary_and_bounded_allocations(tmp_path, monkeypatch):
+    rows = np.zeros((8200, 2), dtype=np.float32)
+    rows[:, 0] = 1
+    eligible = (4095, 4096, 4097, 8199)
+    rows[list(eligible)] = [0, 1]
+    with vector.ExactVectorStore.build(
+        tmp_path,
+        rows=rows,
+        row_ids=tuple("s-" + str(i) for i in range(len(rows))),
+        profile_sha256="a" * 64,
+        normalization_atol=0.001,
+    ) as store:
+        query = np.array([1, 0], dtype=np.float32)
+        baseline = store.search(query, limit=50, block_rows=4096)
+        assert all(hit.vector_row not in eligible for hit in baseline)
+        assert hasattr(store, "search_eligible"), "pre-cap eligible memmap search absent"
+        original = np.einsum
+        shapes = []
+
+        def einsum(expression, block, query, **kwargs):
+            shapes.append(block.shape)
+            assert block.dtype == np.float32 and block.shape[0] <= 4096
+            return original(expression, block, query, **kwargs)
+
+        monkeypatch.setattr(vector.np, "einsum", einsum)
+        # Catch full filtered/full float32 materialization at the actual conversion.
+        original_astype = np.memmap.astype
+        conversions = []
+
+        def astype(array, dtype, **kwargs):
+            conversions.append(array.shape)
+            assert array.shape[0] <= 4096
+            return original_astype(array, dtype, **kwargs)
+
+        monkeypatch.setattr(np.memmap, "astype", astype)
+        hits = store.search_eligible(query, eligible_rows=eligible, limit=3)
+        independent = sorted(
+            ((float(np.dot(rows[i].astype(np.float32), query)), i) for i in eligible),
+            key=lambda value: (-value[0], value[1]),
+        )[:3]
+        assert [(h.score, h.vector_row) for h in hits] == independent
+        assert [h.row_id for h in hits] == ["s-4095", "s-4096", "s-4097"]
+        assert shapes == conversions == [(4096, 2), (4096, 2), (8, 2)]
+        shapes.clear()
+        assert store.search_eligible(query, eligible_rows=(), limit=10) == ()
+        assert not shapes
+        for invalid in ((1, 1), (2, 1), (-1,), (8200,), (True,), [1]):
+            with pytest.raises((TypeError, ValueError)):
+                store.search_eligible(query, eligible_rows=invalid, limit=10)
+        for invalid in (0, 4097, True):
+            with pytest.raises(ValueError):
+                store.search_eligible(query, eligible_rows=(1,), limit=10, block_rows=invalid)
+
+
+def test_scoped_exact_persisted_float16_scores_independent_oracle(tmp_path):
+    rows = np.array([[1, 0], [0.6, 0.8], [-1, 0], [0.8, 0.6], [0, -1]], dtype=np.float32)
+    query = np.array([3, 4], dtype=np.float32)
+    eligible = (0, 2, 3, 4)
+    with vector.ExactVectorStore.build(
+        tmp_path,
+        rows=rows,
+        row_ids=tuple("r" + str(i) for i in range(5)),
+        profile_sha256="a" * 64,
+        normalization_atol=0.001,
+    ) as store:
+        q = query / np.sqrt(np.sum(query * query, dtype=np.float32))
+        expected = sorted(
+            [
+                (float(np.sum(store._vectors[i].astype(np.float32) * q, dtype=np.float32)), i)
+                for i in eligible
+            ],
+            key=lambda value: (-value[0], value[1]),
+        )
+        hits = store.search_eligible(query, eligible_rows=eligible, limit=4, block_rows=2)
+        assert [h.vector_row for h in hits] == [row for _, row in expected]
+        assert [h.score for h in hits] == pytest.approx([score for score, _ in expected], abs=1e-6)

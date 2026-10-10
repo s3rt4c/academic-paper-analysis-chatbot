@@ -6,6 +6,10 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalRequest
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -65,7 +69,53 @@ class RetrievalService:
     """Search persisted active chunks without opening the original PDF."""
 
     def __init__(self, *, data_root: Path) -> None:
+        self._scoped_data_root = Path(data_root)
         self._data_root = data_root.resolve(strict=False)
+
+    def search_scoped(self, request: ScopedRetrievalRequest) -> RetrievalResults:
+        """Select eligible chunks before the channel cap in one read snapshot."""
+        from academic_chatbot.library.repository import guard_scoped_database
+        from academic_chatbot.retrieval.fts import search_active_chunks_scoped
+        from academic_chatbot.retrieval.scoped_models import (
+            ScopedRetrievalError,
+            ScopedRetrievalRequest,
+            validate_hit_scope,
+        )
+
+        try:
+            request = ScopedRetrievalRequest.model_validate(request)
+        except ValidationError:
+            raise ScopedRetrievalError("INVALID_REQUEST") from None
+        if request.mode != "lexical":
+            raise ScopedRetrievalError("INVALID_REQUEST")
+        paths = guard_scoped_database(self._scoped_data_root, request.scope.project_id)
+        try:
+            expression = plan_natural_language_query(request.query).expression
+            connection = open_read_only_connection(paths.database_path, data_root=self._data_root)
+        except RetrievalQueryError:
+            raise ScopedRetrievalError("INVALID_REQUEST") from None
+        except (DatabasePathError, OSError):
+            raise ScopedRetrievalError("STORAGE_UNAVAILABLE") from None
+        try:
+            connection.execute("BEGIN")
+            rows = search_active_chunks_scoped(
+                connection, scope=request.scope, match_expression=expression, limit=request.limit
+            )
+            hits = tuple(
+                _hit_from_row(connection, row=row, rank=rank) for rank, row in enumerate(rows, 1)
+            )
+            for hit in hits:
+                validate_hit_scope(hit, request.scope, None)
+            return RetrievalResults(
+                project_id=request.scope.project_id, query=request.query, hits=hits
+            )
+        except (sqlite3.DatabaseError, RetrievalIntegrityError, ValueError) as error:
+            if isinstance(error, ScopedRetrievalError):
+                raise
+            raise ScopedRetrievalError("STORAGE_INTEGRITY") from None
+        finally:
+            connection.rollback()
+            connection.close()
 
     def search(self, project: Project, query: str, limit: int = 10) -> RetrievalResults:
         if type(limit) is not int or limit <= 0:
@@ -125,22 +175,28 @@ def _hit_from_row(connection: sqlite3.Connection, *, row: sqlite3.Row, rank: int
         raise RetrievalIntegrityError("persisted chunk has no range-scoped anchors")
     try:
         if any(
-            int(anchor_row["char_start"]) < start_offset
-            or int(anchor_row["char_end"]) > end_offset
+            int(anchor_row["char_start"]) < start_offset or int(anchor_row["char_end"]) > end_offset
             for anchor_row in anchor_rows
         ):
             raise RetrievalIntegrityError("persisted anchor extends outside its chunk range")
         anchors = tuple(anchor_from_row(row, anchor_row) for anchor_row in anchor_rows)
         return RetrievalHit(
-            project_id=str(row["project_id"]), paper_id=str(row["paper_id"]),
+            project_id=str(row["project_id"]),
+            paper_id=str(row["paper_id"]),
             file_version_id=str(row["file_version_id"]),
-            document_generation_id=str(row["document_generation_id"]), page_id=str(row["page_id"]),
+            document_generation_id=str(row["document_generation_id"]),
+            page_id=str(row["page_id"]),
             physical_page_index=int(row["physical_page_index"]),
             display_page_number=int(row["display_page_number"]),
-            printed_page_label=row["printed_page_label"], chunk_id=str(row["chunk_id"]),
-            chunk_ordinal=int(row["chunk_ordinal"]), start_offset=start_offset,
-            end_offset=end_offset, chunk_text=chunk_text, rank=rank,
-            raw_bm25_score=float(row["raw_bm25_score"]), anchors=anchors,
+            printed_page_label=row["printed_page_label"],
+            chunk_id=str(row["chunk_id"]),
+            chunk_ordinal=int(row["chunk_ordinal"]),
+            start_offset=start_offset,
+            end_offset=end_offset,
+            chunk_text=chunk_text,
+            rank=rank,
+            raw_bm25_score=float(row["raw_bm25_score"]),
+            anchors=anchors,
         )
     except (KeyError, TypeError, ValueError, ValidationError) as error:
         raise RetrievalIntegrityError("persisted evidence is malformed") from error
@@ -149,21 +205,29 @@ def _hit_from_row(connection: sqlite3.Connection, *, row: sqlite3.Row, rank: int
 def anchor_from_row(row: sqlite3.Row, anchor_row: sqlite3.Row) -> NativePdfAnchor:
     """Reconstruct one validated native anchor from persisted canonical evidence."""
     box = PdfAnchorBox(
-        char_start=int(anchor_row["char_start"]), char_end=int(anchor_row["char_end"]),
-        x0=float(anchor_row["x0"]), top=float(anchor_row["top"]),
-        x1=float(anchor_row["x1"]), bottom=float(anchor_row["bottom"]),
+        char_start=int(anchor_row["char_start"]),
+        char_end=int(anchor_row["char_end"]),
+        x0=float(anchor_row["x0"]),
+        top=float(anchor_row["top"]),
+        x1=float(anchor_row["x1"]),
+        bottom=float(anchor_row["bottom"]),
     )
     file_version_id = str(row["file_version_id"])
     source_pdf_sha256 = str(row["source_pdf_sha256"])
     binding = hashlib.sha256(
         json.dumps(
             {"file_version_id": file_version_id, "pdf_sha256": source_pdf_sha256},
-            sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
     return NativePdfAnchor(
-        evidence_id=str(anchor_row["evidence_id"]), file_version_id=file_version_id,
-        file_version_binding_sha256=binding, source_pdf_sha256=source_pdf_sha256,
+        evidence_id=str(anchor_row["evidence_id"]),
+        file_version_id=file_version_id,
+        file_version_binding_sha256=binding,
+        source_pdf_sha256=source_pdf_sha256,
         parser_profile_sha256=_required_text(row, "parser_profile_sha256"),
         physical_page_index=int(row["physical_page_index"]),
         display_page_number=int(row["display_page_number"]),
@@ -171,12 +235,14 @@ def anchor_from_row(row: sqlite3.Row, anchor_row: sqlite3.Row) -> NativePdfAncho
         page_width_points=float(row["page_width_points"]),
         page_height_points=float(row["page_height_points"]),
         source_page_rotation_degrees=int(row["source_page_rotation_degrees"]),
-        char_start=int(anchor_row["char_start"]), char_end=int(anchor_row["char_end"]),
+        char_start=int(anchor_row["char_start"]),
+        char_end=int(anchor_row["char_end"]),
         canonical_page_text=_required_text(row, "canonical_text"),
         canonical_page_text_sha256=_required_text(row, "canonical_text_sha256"),
         anchor_text=_required_text(anchor_row, "anchor_text"),
         anchor_text_sha256=_required_text(anchor_row, "anchor_text_sha256"),
-        boxes=(box,), boxes_sha256=_required_text(anchor_row, "boxes_sha256"),
+        boxes=(box,),
+        boxes_sha256=_required_text(anchor_row, "boxes_sha256"),
     )
 
 
@@ -185,3 +251,55 @@ def _required_text(row: sqlite3.Row, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise RetrievalIntegrityError(f"persisted {name} is missing")
     return value
+
+
+def preflight_scoped_evidence(
+    connection: sqlite3.Connection,
+    *,
+    page_id: str,
+    chunk_id: str,
+    start: int,
+    end: int,
+) -> int:
+    """Inspect selected row metadata before materializing any text or anchor payload."""
+    from academic_chatbot.evidence.models import (
+        MAX_CHUNK_ANCHORS,
+        MAX_IDENTIFIER_CHARS,
+        MAX_PAGE_TEXT_BYTES,
+        MAX_RESOLVED_TEXT_BYTES,
+    )
+    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+    row = connection.execute(
+        """SELECT length(CAST(p.canonical_text AS BLOB)),
+                  length(CAST(c.chunk_text AS BLOB)),
+                  length(p.printed_page_label),
+                  (SELECT count(*) FROM page_anchors a
+                   WHERE a.page_id=p.page_id AND a.char_start < ? AND a.char_end > ?),
+                  (SELECT coalesce(sum(length(CAST(a.anchor_text AS BLOB))),0)
+                   FROM page_anchors a
+                   WHERE a.page_id=p.page_id AND a.char_start < ? AND a.char_end > ?),
+                  (SELECT coalesce(max(max(length(a.page_anchor_id),length(a.evidence_id))),0)
+                   FROM page_anchors a
+                   WHERE a.page_id=p.page_id AND a.char_start < ? AND a.char_end > ?)
+           FROM pages p JOIN chunks c ON c.page_id=p.page_id
+           WHERE p.page_id=? AND c.chunk_id=?""",
+        (end, start, end, start, end, start, page_id, chunk_id),
+    ).fetchone()
+    if row is None:
+        raise ScopedRetrievalError("STORAGE_INTEGRITY")
+    page_bytes, chunk_bytes, label_length, count, anchor_bytes, id_length = row
+    if page_bytes is None or chunk_bytes is None:
+        raise ScopedRetrievalError("STORAGE_INTEGRITY")
+    # Each returned anchor repeats canonical page text in the existing wire value.
+    total = page_bytes * count + chunk_bytes + anchor_bytes
+    if (
+        page_bytes > MAX_PAGE_TEXT_BYTES
+        or chunk_bytes > MAX_PAGE_TEXT_BYTES
+        or count > MAX_CHUNK_ANCHORS
+        or (label_length or 0) > MAX_IDENTIFIER_CHARS
+        or id_length > MAX_IDENTIFIER_CHARS
+        or total > MAX_RESOLVED_TEXT_BYTES
+    ):
+        raise ScopedRetrievalError("RESOURCE_LIMIT")
+    return int(total)

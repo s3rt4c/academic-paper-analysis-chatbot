@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 
-from academic_chatbot.db.connection import connect_project_database, immediate_transaction
+from academic_chatbot.db.connection import (
+    DatabasePathError,
+    connect_project_database,
+    immediate_transaction,
+    open_read_only_connection,
+)
 from academic_chatbot.documents.chunking import LexicalChunk, chunk_canonical_page
 from academic_chatbot.documents.models import (
     NativePdfDocument,
@@ -79,9 +86,12 @@ class ProjectRepository:
             raise DuplicateProjectError(f"project already exists: {project.project_id}") from error
 
     def paper_exists(self, paper_id: str, project_id: str) -> bool:
-        return self._one(
-            "SELECT 1 FROM papers WHERE paper_id = ? AND project_id = ?", (paper_id, project_id)
-        ) is not None
+        return (
+            self._one(
+                "SELECT 1 FROM papers WHERE paper_id = ? AND project_id = ?", (paper_id, project_id)
+            )
+            is not None
+        )
 
     def create_paper(self, paper: Paper) -> None:
         if not self.project_exists(paper.project_id):
@@ -100,9 +110,7 @@ class ProjectRepository:
             message = f"paper {paper_id} does not belong to project {project_id}"
             raise UnknownPaperError(message)
 
-    def sole_current_paper_source(
-        self, *, project_id: str, paper_id: str
-    ) -> CurrentPaperSource:
+    def sole_current_paper_source(self, *, project_id: str, paper_id: str) -> CurrentPaperSource:
         """Return exactly one published FileVersion without guessing a latest source."""
 
         with self._connection() as connection:
@@ -142,6 +150,67 @@ class ProjectRepository:
             file_version_id=str(rows[0][0]),
             document_generation_id=str(rows[0][1]),
         )
+
+    def sole_current_paper_source_read_only(
+        self, *, project_id: str, paper_id: str
+    ) -> CurrentPaperSource:
+        """Admit one exact source under ordinary SQLite read-snapshot semantics."""
+        from pydantic import TypeAdapter, ValidationError
+
+        from academic_chatbot.evidence.models import BundleSourceScope, Identifier
+        from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+        try:
+            TypeAdapter(Identifier).validate_python(project_id)
+            TypeAdapter(Identifier).validate_python(paper_id)
+        except ValidationError:
+            raise ScopedRetrievalError("INVALID_REQUEST") from None
+        guard_scoped_database(self._paths.data_root, self._paths.project_id)
+        try:
+            connection = open_read_only_connection(
+                self._paths.database_path, data_root=self._paths.data_root
+            )
+        except (DatabasePathError, OSError):
+            raise ScopedRetrievalError("STORAGE_UNAVAILABLE") from None
+        try:
+            connection.execute("BEGIN")
+            paper = connection.execute(
+                "SELECT 1 FROM papers WHERE paper_id = ? AND project_id = ?",
+                (paper_id, project_id),
+            ).fetchone()
+            if paper is None:
+                raise ScopedRetrievalError("SOURCE_NOT_FOUND")
+            # LEFT JOIN exposes broken publication lineage instead of hiding it.
+            rows = connection.execute(
+                """SELECT fv.file_version_id, gp.document_generation_id,
+                          dg.file_version_id AS generation_file_version_id
+                   FROM file_versions AS fv
+                   JOIN papers AS p ON p.paper_id = fv.paper_id
+                   JOIN generation_publications AS gp ON gp.file_version_id = fv.file_version_id
+                   LEFT JOIN document_generations AS dg
+                     ON dg.document_generation_id = gp.document_generation_id
+                   WHERE p.project_id = ? AND p.paper_id = ?
+                   ORDER BY fv.file_version_id, gp.document_generation_id LIMIT 2""",
+                (project_id, paper_id),
+            ).fetchall()
+            if any(row[2] != row[0] for row in rows):
+                raise ScopedRetrievalError("STORAGE_INTEGRITY")
+            if not rows:
+                raise ScopedRetrievalError("SOURCE_NOT_CURRENT")
+            if len(rows) != 1:
+                raise ScopedRetrievalError("SOURCE_SCOPE_AMBIGUOUS")
+            scope = BundleSourceScope(
+                project_id=project_id,
+                paper_id=paper_id,
+                file_version_id=rows[0][0],
+                document_generation_id=rows[0][1],
+            )
+            return CurrentPaperSource(**scope.model_dump())
+        except (sqlite3.DatabaseError, ValidationError):
+            raise ScopedRetrievalError("STORAGE_INTEGRITY") from None
+        finally:
+            connection.rollback()
+            connection.close()
 
     def register_file_version(self, *, file_version: FileVersion) -> FileVersion:
         with self._connection() as connection, immediate_transaction(connection):
@@ -187,9 +256,12 @@ class ProjectRepository:
         self, sha256: str, *, connection: sqlite3.Connection | None = None
     ) -> bool:
         if connection is not None:
-            return connection.execute(
-                "SELECT 1 FROM file_versions WHERE sha256 = ?", (sha256,)
-            ).fetchone() is not None
+            return (
+                connection.execute(
+                    "SELECT 1 FROM file_versions WHERE sha256 = ?", (sha256,)
+                ).fetchone()
+                is not None
+            )
         return self._one("SELECT 1 FROM file_versions WHERE sha256 = ?", (sha256,)) is not None
 
     @contextmanager
@@ -586,3 +658,37 @@ def _page_anchor_id_for(*, page_id: str, evidence_id: str) -> str:
         + evidence_id.encode("ascii")
     )
     return "page-anchor-sha256-" + hashlib.sha256(identity).hexdigest()
+
+
+def guard_scoped_database(root: Path, project_id: str) -> ProjectPaths:
+    """Guard unresolved ancestors and existing exact SQLite coordination files."""
+    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+    if ".." in root.parts:
+        raise ScopedRetrievalError("UNSAFE_PATH")
+    absolute = root.absolute()
+    paths = ProjectPaths.create(absolute, project_id=project_id)
+    components = [
+        *reversed(absolute.parents),
+        absolute,
+        absolute / "projects",
+        absolute / "projects" / project_id,
+    ]
+    entries = [(path, False) for path in components] + [(paths.database_path, True)]
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(paths.database_path) + suffix)
+        if sidecar.exists() or sidecar.is_symlink():
+            entries.append((sidecar, True))
+    for path, file in entries:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            raise ScopedRetrievalError("STORAGE_UNAVAILABLE") from None
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            or not (stat.S_ISREG(metadata.st_mode) if file else stat.S_ISDIR(metadata.st_mode))
+        ):
+            raise ScopedRetrievalError("UNSAFE_PATH")
+    return paths

@@ -147,9 +147,7 @@ class _SemanticService:
         query_selection: SemanticQuerySelection | None = None,
         positional_selection: PositionalAcquisitionSelection,
     ) -> SemanticPositionalAcquisition:
-        self.positional_calls.append(
-            (project, query, limit, query_selection, positional_selection)
-        )
+        self.positional_calls.append((project, query, limit, query_selection, positional_selection))
         baseline = self.hits[:limit]
         positional = self.hits[limit:]
         return SemanticPositionalAcquisition(
@@ -210,9 +208,7 @@ def test_search_forwards_one_explicit_selection_only_to_semantic() -> None:
         _SemanticService(hits=(_semantic(),)),
         _Resolver(),
     )
-    selection = SemanticQuerySelection(
-        mode="concern", concern_id="stated-study-objective-v1"
-    )
+    selection = SemanticQuerySelection(mode="concern", concern_id="stated-study-objective-v1")
 
     result = _service(lexical, semantic, resolver).search(
         _project(), "original query", limit=11, query_selection=selection
@@ -242,14 +238,10 @@ def test_hybrid_without_positional_selection_keeps_existing_calls() -> None:
 def test_hybrid_positional_selection_uses_one_semantic_union() -> None:
     lexical, semantic, resolver = (
         _LexicalService(hits=(_lexical(),)),
-        _SemanticService(
-            hits=(_semantic(rank=1), _semantic(chunk_id="chunk-2", rank=2))
-        ),
+        _SemanticService(hits=(_semantic(rank=1), _semantic(chunk_id="chunk-2", rank=2))),
         _Resolver(),
     )
-    selection = PositionalAcquisitionSelection(
-        concern_id="stated-study-objective-v1"
-    )
+    selection = PositionalAcquisitionSelection(concern_id="stated-study-objective-v1")
 
     result = _service(lexical, semantic, resolver).search(
         _project(), "original query", limit=10, positional_selection=selection
@@ -257,9 +249,7 @@ def test_hybrid_positional_selection_uses_one_semantic_union() -> None:
 
     assert lexical.calls == [(_project(), "original query", 50)]
     assert semantic.calls == []
-    assert semantic.positional_calls == [
-        (_project(), "original query", 10, None, selection)
-    ]
+    assert semantic.positional_calls == [(_project(), "original query", 10, None, selection)]
     assert result.query == "original query"
     assert result.fusion_profile_id == "rrf-v1"
 
@@ -270,9 +260,7 @@ def test_hybrid_positional_selection_keeps_lexical_query_unchanged() -> None:
         _SemanticService(hits=(_semantic(),)),
         _Resolver(),
     )
-    selection = PositionalAcquisitionSelection(
-        concern_id="stated-study-objective-v1"
-    )
+    selection = PositionalAcquisitionSelection(concern_id="stated-study-objective-v1")
 
     _service(lexical, semantic, resolver).search(
         _project(), "user question", limit=10, positional_selection=selection
@@ -326,9 +314,7 @@ def test_hybrid_does_not_create_a_third_channel() -> None:
     result = _service(lexical, semantic, resolver).search(
         _project(),
         "query",
-        positional_selection=PositionalAcquisitionSelection(
-            concern_id="stated-study-objective-v1"
-        ),
+        positional_selection=PositionalAcquisitionSelection(concern_id="stated-study-objective-v1"),
     )
 
     assert len(semantic.positional_calls) == 1
@@ -400,3 +386,229 @@ def test_service_preserves_task_two_order_and_does_not_rerank_parent_context() -
     assert [hit.identity.chunk_id for hit in result.hits] == ["chunk-early", "chunk-late"]
     assert [hit.trace.fusion_rank for hit in result.hits] == [1, 2]
     assert resolver.calls == ["chunk-early", "chunk-late"]
+
+
+def test_scoped_hybrid_starvation_independent_fraction_oracle(tmp_path):
+    from fractions import Fraction
+
+    from tests.fixtures.retrieval.scoped import crowded, lexical_oracle, semantic_oracle
+
+    fixture = crowded(tmp_path, vectors=True)
+    service = HybridRetrievalService(
+        data_root=fixture.db.paths.data_root, semantic_service=fixture.semantic
+    )
+    before = service.search(fixture.project, "Alpha", limit=10)
+    assert all(h.parent_chunk.paper_id == "distractor" for h in before.hits)
+    assert hasattr(service, "search_scoped"), "scoped hybrid acquisition absent"
+    lexical = lexical_oracle(fixture)
+    semantic = semantic_oracle(fixture)
+    lex_ranks = {r[0]: i for i, r in enumerate(lexical, 1)}
+    sem_ranks = {r[2]: i for i, r in enumerate(semantic, 1)}
+    expected = sorted(
+        lex_ranks,
+        key=lambda chunk: (
+            -(Fraction(1, 40 + lex_ranks[chunk]) + Fraction(1, 40 + sem_ranks[chunk])),
+            min(lex_ranks[chunk], sem_ranks[chunk]),
+            -2,
+            lex_ranks[chunk],
+            sem_ranks[chunk],
+            (
+                "project-one",
+                fixture.scope.document_generation_id,
+                next(r[3] for r in semantic if r[2] == chunk),
+                chunk,
+            ),
+        ),
+    )
+    result = service.search_scoped(fixture.request("hybrid"))
+    assert [h.identity.chunk_id for h in result.hits] == expected
+    for hit in result.hits:
+        score = Fraction(1, 40 + lex_ranks[hit.identity.chunk_id]) + Fraction(
+            1, 40 + sem_ranks[hit.identity.chunk_id]
+        )
+        assert (hit.trace.fusion_score.numerator, hit.trace.fusion_score.denominator) == (
+            score.numerator,
+            score.denominator,
+        )
+        assert hit.parent_chunk.paper_id == "selected"
+        assert hit.lexical_contribution and hit.semantic_contribution
+    assert service.search(fixture.project, "Alpha", limit=10) == before
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "lexical_empty",
+        "semantic_empty",
+        "both_empty",
+        "duplicate",
+        "contradictory",
+        "unavailable",
+    ],
+)
+def test_scoped_hybrid_channels_empty_duplicate_and_failures(tmp_path, kind):
+    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+    from academic_chatbot.retrieval.service import RetrievalService
+    from tests.fixtures.retrieval.scoped import crowded
+
+    fixture = crowded(tmp_path, vectors=True)
+    calls = []
+
+    class Lexical:
+        def search(self, *args, **kwargs):
+            raise AssertionError("project cap used")
+
+        def search_scoped(self, request):
+            calls.append(request)
+            result = RetrievalService(data_root=fixture.db.paths.data_root).search_scoped(request)
+            if kind in {"lexical_empty", "both_empty"}:
+                return result.model_copy(update={"hits": ()})
+            if kind in {"duplicate", "contradictory"}:
+                hit = result.hits[0]
+                extra = (
+                    hit
+                    if kind == "duplicate"
+                    else hit.model_copy(update={"chunk_text": "contradictory"})
+                )
+                return result.model_copy(update={"hits": (*result.hits, extra)})
+            return result
+
+    class Semantic:
+        def search(self, *args, **kwargs):
+            raise AssertionError("project cap used")
+
+        def search_scoped(self, request):
+            calls.append(request)
+            if kind == "unavailable":
+                raise ScopedRetrievalError("VECTOR_UNAVAILABLE")
+            result = fixture.semantic.search_scoped(request)
+            if kind in {"semantic_empty", "both_empty"}:
+                return result.model_copy(update={"hits": ()})
+            return result
+
+    service = HybridRetrievalService(
+        data_root=fixture.db.paths.data_root, lexical_service=Lexical(), semantic_service=Semantic()
+    )
+    assert hasattr(service, "search_scoped"), "scoped hybrid acquisition absent"
+    if kind in {"contradictory", "unavailable"}:
+        with pytest.raises(ScopedRetrievalError):
+            service.search_scoped(fixture.request("hybrid"))
+    else:
+        result = service.search_scoped(fixture.request("hybrid"))
+        assert len(result.hits) == (0 if kind == "both_empty" else 2)
+        for hit in result.hits:
+            assert (hit.lexical_contribution is None) == (kind == "lexical_empty")
+            assert (hit.semantic_contribution is None) == (kind == "semantic_empty")
+    assert all(r.limit == 50 and r.scope == fixture.scope for r in calls)
+
+
+def test_scoped_parent_resource_failure_remains_resource_limit(tmp_path, monkeypatch):
+    from academic_chatbot.retrieval.scoped_models import (
+        ScopedRetrievalError,
+        ScopedRetrievalRequest,
+        policy_for,
+    )
+    from academic_chatbot.retrieval.service import RetrievalService
+    from tests.fixtures.retrieval.scoped import crowded
+
+    fixture = crowded(tmp_path, vectors=True)
+    request = fixture.request("hybrid")
+    lex_request = ScopedRetrievalRequest(
+        scope=request.scope,
+        query=request.query,
+        mode="lexical",
+        limit=50,
+        policy=policy_for("lexical"),
+        semantic_identity=None,
+    )
+    sem_request = ScopedRetrievalRequest(
+        scope=request.scope,
+        query=request.query,
+        mode="semantic",
+        limit=50,
+        policy=policy_for("semantic"),
+        semantic_identity=request.semantic_identity,
+    )
+    lexical = RetrievalService(data_root=fixture.db.paths.data_root).search_scoped(lex_request)
+    semantic = fixture.semantic.search_scoped(sem_request)
+    fixture.db.corrupt(
+        "UPDATE pages SET canonical_text=? WHERE document_generation_id=?",
+        ("Alpha " + "x" * 1048576, fixture.scope.document_generation_id),
+    )
+
+    class Lexical:
+        def search_scoped(self, request):
+            return lexical
+
+    class Semantic:
+        def search_scoped(self, request):
+            return semantic
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("parent full text materialized before preflight")
+
+    monkeypatch.setattr(
+        "academic_chatbot.retrieval.hybrid_service._parent_context_from_row", forbidden
+    )
+    service = HybridRetrievalService(
+        data_root=fixture.db.paths.data_root, lexical_service=Lexical(), semantic_service=Semantic()
+    )
+    with pytest.raises(ScopedRetrievalError) as caught:
+        service.search_scoped(request)
+    assert caught.value.code == "RESOURCE_LIMIT"
+
+
+@pytest.mark.parametrize("change", ["snapshot_bound", "vector_stale"])
+def test_scoped_parent_rechecks_bounded_vector_authority(tmp_path, monkeypatch, change):
+    from academic_chatbot.evidence import models
+    from academic_chatbot.retrieval.scoped_models import (
+        ScopedRetrievalError,
+        ScopedRetrievalRequest,
+        policy_for,
+    )
+    from academic_chatbot.retrieval.service import RetrievalService
+    from tests.fixtures.retrieval.scoped import crowded
+
+    fixture = crowded(tmp_path, vectors=True)
+    request = fixture.request("hybrid")
+    lexical = RetrievalService(data_root=fixture.db.paths.data_root).search_scoped(
+        ScopedRetrievalRequest(
+            scope=request.scope,
+            query=request.query,
+            mode="lexical",
+            limit=50,
+            policy=policy_for("lexical"),
+            semantic_identity=None,
+        )
+    )
+    semantic = fixture.semantic.search_scoped(
+        ScopedRetrievalRequest(
+            scope=request.scope,
+            query=request.query,
+            mode="semantic",
+            limit=50,
+            policy=policy_for("semantic"),
+            semantic_identity=request.semantic_identity,
+        )
+    )
+
+    class Lexical:
+        def search_scoped(self, request):
+            return lexical
+
+    class Semantic:
+        def search_scoped(self, request):
+            return semantic
+
+    if change == "snapshot_bound":
+        monkeypatch.setattr(models, "MAX_SOURCE_SNAPSHOT_ROWS", 1)
+    else:
+        fixture.db.execute("DELETE FROM vector_generation_publications")
+    service = HybridRetrievalService(
+        data_root=fixture.db.paths.data_root, lexical_service=Lexical(), semantic_service=Semantic()
+    )
+    with pytest.raises(ScopedRetrievalError) as caught:
+        service.search_scoped(request)
+    assert caught.value.code == (
+        "RESOURCE_LIMIT" if change == "snapshot_bound" else "VECTOR_NOT_CURRENT"
+    )

@@ -40,3 +40,39 @@ def test_paper_creation_persists_the_project_ownership(tmp_path: Path) -> None:
     assert paper.paper_id == "paper-1"
     assert paper.project_id == project.project_id
     assert service.repository_for(project).paper_exists(paper.paper_id, project.project_id)
+
+
+@pytest.mark.parametrize(
+    "kind,code",
+    [
+        ("missing", "STORAGE_UNAVAILABLE"),
+        ("unknown", "SOURCE_NOT_FOUND"),
+        ("foreign", "SOURCE_NOT_FOUND"),
+        ("zero", "SOURCE_NOT_CURRENT"),
+        ("multiple", "SOURCE_SCOPE_AMBIGUOUS"),
+    ],
+)
+def test_read_only_source_admission_fail_closed(tmp_path, kind, code):
+    from academic_chatbot.library.repository import ProjectRepository
+    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+    from academic_chatbot.storage.paths import ProjectPaths
+    from tests.fixtures.evidence_bundle.database import database
+
+    if kind == "missing":
+        paths = ProjectPaths.create(tmp_path / "absent", project_id="project-one")
+        paper = "paper-one"
+    else:
+        db = database(tmp_path, older=kind == "multiple")
+        paths = db.paths
+        paper = "unknown" if kind == "unknown" else "paper-one"
+        if kind == "zero":
+            db.execute("DELETE FROM generation_publications")
+    repository = ProjectRepository(paths)
+    assert hasattr(repository, "sole_current_paper_source_read_only"), "read-only admission absent"
+    with pytest.raises(ScopedRetrievalError) as caught:
+        repository.sole_current_paper_source_read_only(
+            project_id="foreign" if kind == "foreign" else "project-one", paper_id=paper
+        )
+    assert caught.value.code == code
+    if kind == "missing":
+        assert not paths.data_root.exists()
