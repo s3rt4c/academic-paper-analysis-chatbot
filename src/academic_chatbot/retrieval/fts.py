@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from academic_chatbot.evidence.models import BundleSourceScope
 
 
 class RetrievalQueryError(ValueError):
@@ -43,13 +47,14 @@ _ACTIVE_SEARCH_SQL = """
     LIMIT ?
 """
 
+
 def build_literal_match_expression(query: str) -> str:
     """Quote every user term so FTS5 operators cannot become syntax."""
 
     terms = query.split()
     if not terms or not any(character.isalnum() for term in terms for character in term):
         raise RetrievalQueryError("query must contain meaningful lexical content")
-    return " ".join(f'"{term.replace("\"", "\"\"")}"' for term in terms)
+    return " ".join(f'"{term.replace('"', '""')}"' for term in terms)
 
 
 def search_active_chunks(
@@ -57,9 +62,7 @@ def search_active_chunks(
 ) -> tuple[sqlite3.Row, ...]:
     """Return bounded active project chunks in deterministic BM25 order."""
 
-    connection.execute(
-        _ACTIVE_SEARCH_SQL, ('"task5-schema-probe"', project_id, 0)
-    ).fetchall()
+    connection.execute(_ACTIVE_SEARCH_SQL, ('"task5-schema-probe"', project_id, 0)).fetchall()
     try:
         rows = connection.execute(
             _ACTIVE_SEARCH_SQL, (match_expression, project_id, limit)
@@ -67,3 +70,59 @@ def search_active_chunks(
     except sqlite3.OperationalError as error:
         raise RetrievalQueryError("plain lexical query could not be searched") from error
     return tuple(rows)
+
+
+def search_active_chunks_scoped(
+    connection: sqlite3.Connection,
+    *,
+    scope: BundleSourceScope,
+    match_expression: str,
+    limit: int,
+) -> tuple[sqlite3.Row, ...]:
+    """Scope eligibility precedes the existing BM25 ordering and LIMIT."""
+    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+    from academic_chatbot.retrieval.service import preflight_scoped_evidence
+
+    sql = _ACTIVE_SEARCH_SQL.replace(
+        "WHERE chunk_fts MATCH ? AND projects.project_id = ?",
+        """WHERE chunk_fts MATCH ? AND projects.project_id = ?
+           AND papers.paper_id = ? AND file_versions.file_version_id = ?
+           AND document_generations.document_generation_id = ?""",
+    )
+    args = (
+        match_expression,
+        scope.project_id,
+        scope.paper_id,
+        scope.file_version_id,
+        scope.document_generation_id,
+        limit,
+    )
+    connection.execute(sql, ('"task5-schema-probe"', *args[1:-1], 0)).fetchall()
+    # Same WHERE, comparator and cap in this transaction; no page/FTS text fetched.
+    preflight_sql = (
+        "SELECT chunks.chunk_id, pages.page_id, chunks.start_offset, chunks.end_offset, "
+        "length(CAST(chunk_fts.chunk_text AS BLOB)) AS indexed_text_bytes "
+    ) + ("FROM chunk_fts" + sql.partition("FROM chunk_fts")[2])
+    selected = connection.execute(preflight_sql, args).fetchall()
+    total = 0
+    from academic_chatbot.evidence.models import MAX_PAGE_TEXT_BYTES
+
+    for row in selected:
+        if row["indexed_text_bytes"] > MAX_PAGE_TEXT_BYTES:
+            raise ScopedRetrievalError("RESOURCE_LIMIT")
+        total += row["indexed_text_bytes"]
+        total += preflight_scoped_evidence(
+            connection,
+            page_id=row["page_id"],
+            chunk_id=row["chunk_id"],
+            start=row["start_offset"],
+            end=row["end_offset"],
+        )
+    from academic_chatbot.evidence.models import MAX_RESOLVED_TEXT_BYTES
+
+    if total > MAX_RESOLVED_TEXT_BYTES:
+        raise ScopedRetrievalError("RESOURCE_LIMIT")
+    rows = tuple(connection.execute(sql, args).fetchall())
+    if tuple(row["chunk_id"] for row in rows) != tuple(row["chunk_id"] for row in selected):
+        raise ScopedRetrievalError("INTERNAL_INVARIANT_FAILURE")
+    return rows

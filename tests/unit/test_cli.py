@@ -583,8 +583,7 @@ def test_cli_hybrid_mode_requires_the_existing_semantic_inputs(tmp_path: Path, c
     assert main(arguments) == 2
 
     assert (
-        "hybrid search requires --embedding-profile-id and --model-root"
-        in capsys.readouterr().err
+        "hybrid search requires --embedding-profile-id and --model-root" in capsys.readouterr().err
     )
 
 
@@ -744,3 +743,87 @@ def test_cli_search_help_lists_hybrid_without_opening_retrieval_runtime(
 
     output = capsys.readouterr().out
     assert "{lexical,semantic,hybrid}" in output
+
+
+@pytest.mark.parametrize(
+    "extra,code",
+    [
+        (["--limit", "101"], "INVALID_REQUEST"),
+        (["--limit", "SECRET-CANARY"], "INVALID_REQUEST"),
+        (["--mode", "unknown-SECRET"], "INVALID_REQUEST"),
+        (["--embedding-profile-id", "irrelevant"], "INVALID_REQUEST"),
+        (["--mode", "semantic"], "INVALID_REQUEST"),
+    ],
+)
+def test_scoped_cli_errors_sanitized_before_library(tmp_path, capsys, monkeypatch, extra, code):
+    from academic_chatbot.cli import main
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("scoped search constructed writable library")
+
+    monkeypatch.setattr("academic_chatbot.cli.LibraryService", forbidden)
+    result = main(
+        [
+            "--data-root",
+            str(tmp_path),
+            "--max-pdf-bytes",
+            "100",
+            "search",
+            "--project-id",
+            "p",
+            "--paper-id",
+            "paper",
+            "--query",
+            "PRIVATE-QUERY",
+            *extra,
+        ]
+    )
+    captured = capsys.readouterr()
+    assert result == 2 and captured.out == ""
+    payload = json.loads(captured.err)
+    assert set(payload) == {"schema_version", "error"}
+    assert payload["schema_version"] == "source-scoped-search-error-v1"
+    assert payload["error"]["code"] == code
+    assert "SECRET" not in captured.err and "PRIVATE" not in captured.err
+    assert str(tmp_path) not in captured.err
+
+
+def test_scoped_cli_source_lineage_empty_and_legacy_bytes(tmp_path, capsys, monkeypatch):
+    from academic_chatbot.cli import main
+    from tests.fixtures.retrieval.scoped import crowded
+
+    fixture = crowded(tmp_path)
+    base = [
+        "--data-root",
+        str(fixture.db.paths.data_root),
+        "--max-pdf-bytes",
+        "1000000",
+        "search",
+        "--project-id",
+        "project-one",
+        "--query",
+        "Alpha",
+    ]
+    assert main(base) == 0
+    legacy = capsys.readouterr()
+    assert "schema_version" not in json.loads(legacy.out)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("scoped search constructed writable library")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("academic_chatbot.cli.LibraryService", forbidden)
+        assert main([*base, "--paper-id", "selected"]) == 0
+        scoped = capsys.readouterr()
+        payload = json.loads(scoped.out)
+        assert payload["mode"] == "lexical" and len(payload["hits"]) == 2
+        assert payload["source"] == fixture.scope.model_dump(mode="json")
+        assert scoped.err == ""
+        empty = [token if token != "Alpha" else "absentterm" for token in base]
+        assert main([*empty, "--paper-id", "selected"]) == 0
+        assert json.loads(capsys.readouterr().out)["hits"] == []
+    assert main(base) == 0
+    assert capsys.readouterr() == legacy
+    # Old project cap accepts >100 and retains its payload contract.
+    assert main([*base, "--limit", "101"]) == 0
+    assert len(json.loads(capsys.readouterr().out)["hits"]) == 66
