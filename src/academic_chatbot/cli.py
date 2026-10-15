@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
+    from academic_chatbot.evidence.inspection_models import EvidenceInspectionResult
     from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+    from academic_chatbot.retrieval.scoped_service import SourceScopedRetrievalService
 
 from academic_chatbot.documents.import_service import DocumentImportService
 from academic_chatbot.documents.native_pdf import NativePdfParser
@@ -93,14 +95,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     tokens = list(sys.argv[1:] if argv is None else argv)
     evidence_invocation = _is_evidence_invocation(tokens)
+    inspection_invocation = _is_inspection_invocation(tokens)
     ask_invocation = _is_ask_invocation(tokens)
     scoped_invocation = _root_command(tokens) == "search" and any(
         token == "--paper-id" or token.startswith("--paper-id=") for token in tokens
     )
-    parser = _parser(preview_errors=evidence_invocation or ask_invocation or scoped_invocation)
+    parser = _parser(
+        preview_errors=evidence_invocation
+        or inspection_invocation
+        or ask_invocation
+        or scoped_invocation
+    )
     try:
         arguments = parser.parse_args(tokens)
     except EvidencePreparationError as error:
+        if inspection_invocation:
+            from academic_chatbot.evidence.inspection_models import inspection_failure
+
+            return _write_inspection_result(inspection_failure(error))
         if scoped_invocation:
             from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
 
@@ -115,6 +127,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "search" and arguments.paper_id is not None:
         return _dispatch_scoped_search(arguments)
     if arguments.command == "evidence-bundle":
+        if arguments.evidence_command == "inspect":
+            return _dispatch_inspection(arguments)
         return _dispatch_evidence_preview(arguments)
     if arguments.command == "evidence-group":
         return _dispatch_evidence_group_preview(arguments)
@@ -164,6 +178,27 @@ def _is_evidence_invocation(tokens: Sequence[str]) -> bool:
 
 def _is_ask_invocation(tokens: Sequence[str]) -> bool:
     return _root_command(tokens) == "ask"
+
+
+def _is_inspection_invocation(tokens: Sequence[str]) -> bool:
+    """Recognize inspect even when a preceding global option lacks its value."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"--data-root", "--max-pdf-bytes"}:
+            index += 1
+            if index < len(tokens):
+                value = tokens[index]
+                command_pair = tokens[index : index + 2] == ["evidence-bundle", "inspect"]
+                if (not value.startswith("-") or value.lstrip("-").isdigit()) and not (
+                    token == "--max-pdf-bytes" and command_pair
+                ):
+                    index += 1
+        elif token.startswith("-"):
+            index += 1
+        else:
+            return tokens[index : index + 2] == ["evidence-bundle", "inspect"]
+    return False
 
 
 def _root_command(tokens: Sequence[str]) -> str | None:
@@ -465,6 +500,16 @@ def _parser(*, preview_errors: bool = False) -> argparse.ArgumentParser:
     )
     preview = evidence.add_parser("preview")
     preview.add_argument("--request-stdin", action="store_true", required=True)
+    inspect = evidence.add_parser("inspect")
+    inspect.add_argument("--project-id", action=_StoreOnce, required=True)
+    inspect.add_argument("--paper-id", action=_StoreOnce, required=True)
+    inspect.add_argument("--query", action=_StoreOnce, required=True)
+    inspect.add_argument("--mode", choices=("lexical", "semantic", "hybrid"), default="lexical")
+    inspect.add_argument("--limit", type=int, default=10)
+    inspect.add_argument("--embedding-profile-id", action=_StoreOnce)
+    inspect.add_argument("--model-root", action=_StoreOnce)
+    inspect.add_argument("--preview-entries", type=int, default=8)
+    inspect.add_argument("--preview-bytes", type=int, default=16384)
     evidence_group = commands.add_parser("evidence-group").add_subparsers(
         dest="evidence_group_command", required=True
     )
@@ -634,56 +679,62 @@ def _write_scoped_search_error(error: ScopedRetrievalError) -> int:
     return 2
 
 
-def _dispatch_scoped_search(arguments: argparse.Namespace) -> int:
+def _build_scoped_retrieval(arguments: argparse.Namespace) -> SourceScopedRetrievalService:
     from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+    from academic_chatbot.retrieval.scoped_service import SourceScopedRetrievalService
+
+    if arguments.max_pdf_bytes <= 0:
+        raise ScopedRetrievalError("INVALID_REQUEST")
+    if arguments.mode == "lexical":
+        if arguments.embedding_profile_id is not None or arguments.model_root is not None:
+            raise ScopedRetrievalError("INVALID_REQUEST")
+    elif not arguments.embedding_profile_id or not arguments.model_root:
+        raise ScopedRetrievalError("INVALID_REQUEST")
+    root = Path(arguments.data_root)
+    if not root.is_absolute():
+        raise ScopedRetrievalError("UNSAFE_PATH")
+    paths = ProjectPaths.create(root, project_id=arguments.project_id)
+
+    def semantic_factory() -> SemanticRetrievalService:
+        import stat
+
+        model_root = Path(arguments.model_root)
+        if not model_root.is_absolute() or ".." in model_root.parts:
+            raise ScopedRetrievalError("UNSAFE_PATH")
+        for path in (*reversed(model_root.parents), model_root):
+            try:
+                metadata = path.lstat()
+            except OSError:
+                raise ScopedRetrievalError("PROFILE_MISMATCH") from None
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            ):
+                raise ScopedRetrievalError("UNSAFE_PATH")
+        return SemanticRetrievalService.open_from_model_root(
+            data_root=root,
+            project_id=arguments.project_id,
+            profile_id=arguments.embedding_profile_id,
+            model_root=model_root,
+            scoped=True,
+        )
+
+    return SourceScopedRetrievalService(
+        data_root=root,
+        repository=ProjectRepository(paths),
+        lexical_service=RetrievalService(data_root=root),
+        semantic_service=semantic_factory if arguments.mode != "lexical" else None,
+    )
+
+
+def _dispatch_scoped_search(arguments: argparse.Namespace) -> int:
     from academic_chatbot.retrieval.scoped_serialization import canonical_scoped_result_bytes
-    from academic_chatbot.retrieval.scoped_service import SourceScopedRetrievalService, safe_error
+    from academic_chatbot.retrieval.scoped_service import safe_error
 
     try:
-        if arguments.max_pdf_bytes <= 0:
-            raise ScopedRetrievalError("INVALID_REQUEST")
-        if arguments.mode == "lexical":
-            if arguments.embedding_profile_id is not None or arguments.model_root is not None:
-                raise ScopedRetrievalError("INVALID_REQUEST")
-        elif not arguments.embedding_profile_id or not arguments.model_root:
-            raise ScopedRetrievalError("INVALID_REQUEST")
-        root = Path(arguments.data_root)
-        if not root.is_absolute():
-            raise ScopedRetrievalError("UNSAFE_PATH")
-        paths = ProjectPaths.create(root, project_id=arguments.project_id)
-
-        def semantic_factory() -> SemanticRetrievalService:
-            import stat
-
-            model_root = Path(arguments.model_root)
-            if not model_root.is_absolute() or ".." in model_root.parts:
-                raise ScopedRetrievalError("UNSAFE_PATH")
-            for path in (*reversed(model_root.parents), model_root):
-                try:
-                    metadata = path.lstat()
-                except OSError:
-                    raise ScopedRetrievalError("PROFILE_MISMATCH") from None
-                if (
-                    not stat.S_ISDIR(metadata.st_mode)
-                    or stat.S_ISLNK(metadata.st_mode)
-                    or getattr(metadata, "st_file_attributes", 0)
-                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-                ):
-                    raise ScopedRetrievalError("UNSAFE_PATH")
-            return SemanticRetrievalService.open_from_model_root(
-                data_root=root,
-                project_id=arguments.project_id,
-                profile_id=arguments.embedding_profile_id,
-                model_root=model_root,
-                scoped=True,
-            )
-
-        service = SourceScopedRetrievalService(
-            data_root=root,
-            repository=ProjectRepository(paths),
-            lexical_service=RetrievalService(data_root=root),
-            semantic_service=semantic_factory if arguments.mode != "lexical" else None,
-        )
+        service = _build_scoped_retrieval(arguments)
         request = service.prepare_request(
             project_id=arguments.project_id,
             paper_id=arguments.paper_id,
@@ -698,3 +749,62 @@ def _dispatch_scoped_search(arguments: argparse.Namespace) -> int:
     sys.stdout.buffer.write(payload + b"\n")
     sys.stdout.buffer.flush()
     return 0
+
+
+def _write_inspection_result(result: EvidenceInspectionResult) -> int:
+    from academic_chatbot.evidence.inspection_models import inspection_failure
+    from academic_chatbot.evidence.inspection_serialization import canonical_inspection_result_bytes
+
+    try:
+        output = canonical_inspection_result_bytes(result) + b"\n"
+    except Exception as error:
+        result = inspection_failure(error, request_fingerprint=result.request_fingerprint)
+        output = canonical_inspection_result_bytes(result) + b"\n"
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.flush()
+    return (
+        0
+        if result.outcome in ("ready", "partial")
+        else 3
+        if result.outcome == "insufficient"
+        else 2
+    )
+
+
+def _dispatch_inspection(arguments: argparse.Namespace) -> int:
+    from pydantic import TypeAdapter
+
+    from academic_chatbot.evidence.inspection_models import (
+        EvidenceInspectionRequest,
+        inspection_failure,
+    )
+    from academic_chatbot.evidence.inspection_service import EvidenceInspectionService
+    from academic_chatbot.evidence.models import Identifier, PreviewBudget
+
+    try:
+        budget = PreviewBudget(
+            max_entries=arguments.preview_entries, max_content_bytes=arguments.preview_bytes
+        )
+        for identifier in (arguments.project_id, arguments.paper_id):
+            TypeAdapter(Identifier).validate_python(identifier)
+        retrieval = _build_scoped_retrieval(arguments)
+        request = EvidenceInspectionRequest(
+            retrieval_request=retrieval.prepare_request(
+                project_id=arguments.project_id,
+                paper_id=arguments.paper_id,
+                query=arguments.query,
+                mode=arguments.mode,
+                limit=arguments.limit,
+                embedding_profile_id=arguments.embedding_profile_id,
+            ),
+            preview_budget=budget,
+        )
+        result = EvidenceInspectionService(
+            retrieval_service=retrieval,
+            bundle_service=EvidenceBundleService(
+                resolver=EvidenceReadResolver(data_root=Path(arguments.data_root))
+            ),
+        ).inspect(request)
+    except Exception as error:
+        result = inspection_failure(error)
+    return _write_inspection_result(result)

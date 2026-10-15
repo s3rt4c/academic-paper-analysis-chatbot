@@ -827,3 +827,229 @@ def test_scoped_cli_source_lineage_empty_and_legacy_bytes(tmp_path, capsys, monk
     # Old project cap accepts >100 and retains its payload contract.
     assert main([*base, "--limit", "101"]) == 0
     assert len(json.loads(capsys.readouterr().out)["hits"]) == 66
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--limit", "101"],
+        ["--limit", "SECRET"],
+        ["--mode", "SECRET"],
+        ["--preview-entries", "0"],
+        ["--preview-bytes", "76"],
+        ["--model-root", "C:/SECRET"],
+        ["--mode", "semantic"],
+        ["--request-stdin"],
+        ["--export", "C:/SECRET"],
+        ["--paper-id", "other"],
+    ],
+)
+def test_inspection_cli_parse_rejections_are_safe_stdout_envelopes(
+    tmp_path, capsys, monkeypatch, extra
+):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("inspection initialized writer/model")
+
+    monkeypatch.setattr("academic_chatbot.cli.LibraryService", forbidden)
+    monkeypatch.setattr("academic_chatbot.cli.OfflineEmbedder.open", forbidden)
+    code = main(
+        [
+            "--data-root",
+            str(tmp_path),
+            "--max-pdf-bytes",
+            "100",
+            "evidence-bundle",
+            "inspect",
+            "--project-id",
+            "p",
+            "--paper-id",
+            "paper",
+            "--query",
+            "PRIVATE",
+            *extra,
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 2 and captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["schema_version"] == "evidence-inspection-result-v1"
+    assert payload["outcome"] == "rejected" and payload["error"]["code"] == "INVALID_REQUEST"
+    assert payload["request_fingerprint"] is None and "bundle" not in payload
+    assert "PRIVATE" not in captured.out and "SECRET" not in captured.out
+    assert str(tmp_path) not in captured.out and captured.out.endswith("\n")
+
+
+@pytest.mark.parametrize(
+    "extra,outcome,exit_code",
+    [
+        ([], "ready", 0),
+        (["--preview-entries", "1"], "partial", 0),
+        (["--preview-bytes", "77"], "insufficient", 3),
+    ],
+)
+def test_inspection_cli_uses_real_authority_without_generation(
+    tmp_path, capsys, monkeypatch, extra, outcome, exit_code
+):
+    from tests.fixtures.retrieval.scoped import crowded
+
+    fixture = crowded(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("inspection initialized generation/writer/runtime")
+
+    for name in (
+        "LibraryService",
+        "_build_ask_service",
+        "_LazyVerifiedLlamaCppModel",
+        "load_llama_runtime_manifest",
+        "load_gguf_model_manifest",
+    ):
+        monkeypatch.setattr("academic_chatbot.cli." + name, forbidden)
+    monkeypatch.setattr("academic_chatbot.cli.OfflineEmbedder.open", forbidden)
+    argv = [
+        "--data-root",
+        str(fixture.db.paths.data_root),
+        "--max-pdf-bytes",
+        "1000000",
+        "evidence-bundle",
+        "inspect",
+        "--project-id",
+        "project-one",
+        "--paper-id",
+        "selected",
+        "--query",
+        "Alpha",
+        *extra,
+    ]
+    assert main(argv) == exit_code
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["outcome"] == outcome and captured.err == ""
+    assert payload["bundle_fingerprint"] == payload["bundle"]["fingerprint"]
+    assert (
+        captured.out
+        == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    assert main(argv) == exit_code and capsys.readouterr() == captured
+
+
+def test_inspection_cli_missing_authority_help_and_required_paper(tmp_path, capsys):
+    assert main(["evidence-bundle", "inspect", "--help"]) == 0
+    help_text = capsys.readouterr().out
+    assert "--preview-bytes" in help_text and "--preview-entries" in help_text
+    base = [
+        "--data-root",
+        str(tmp_path),
+        "--max-pdf-bytes",
+        "100",
+        "evidence-bundle",
+        "inspect",
+        "--project-id",
+        "p",
+        "--query",
+        "PRIVATE",
+    ]
+    assert main(base) == 2
+    captured = capsys.readouterr()
+    assert captured.err == "" and json.loads(captured.out)["outcome"] == "rejected"
+    assert main([*base, "--paper-id", "paper"]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert captured.err == "" and payload["outcome"] == "failed"
+    assert payload["error"]["code"] == "STORAGE_UNAVAILABLE" and "bundle" not in payload
+
+
+@pytest.mark.parametrize("failure", ["unknown_paper", "bundle_canary"])
+def test_inspection_cli_authority_failures_are_canonical_and_sanitized(
+    tmp_path, capsys, monkeypatch, failure
+):
+    from tests.fixtures.retrieval.scoped import crowded
+
+    fixture = crowded(tmp_path)
+
+    def broken_bundle(*args, **kwargs):
+        raise RuntimeError("SECRET-CANARY C:/private/database.sqlite")
+
+    if failure == "bundle_canary":
+        monkeypatch.setattr("academic_chatbot.cli.EvidenceBundleService.build", broken_bundle)
+    argv = [
+        "--data-root",
+        str(fixture.db.paths.data_root),
+        "--max-pdf-bytes",
+        "1000000",
+        "evidence-bundle",
+        "inspect",
+        "--project-id",
+        "project-one",
+        "--paper-id",
+        "missing" if failure == "unknown_paper" else "selected",
+        "--query",
+        "PRIVATE-QUERY",
+    ]
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert captured.err == "" and "bundle" not in payload
+    assert payload["outcome"] == ("rejected" if failure == "unknown_paper" else "failed")
+    assert payload["error"]["code"] == (
+        "SOURCE_NOT_FOUND" if failure == "unknown_paper" else "INTERNAL_INVARIANT_FAILURE"
+    )
+    assert (
+        captured.out
+        == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    assert "SECRET" not in captured.out and "PRIVATE" not in captured.out
+    assert str(tmp_path) not in captured.out
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        ["--data-root", "--max-pdf-bytes", "100"],
+        ["--max-pdf-bytes", "--data-root", "C:/SECRET"],
+        ["--data-root", "C:/SECRET", "--max-pdf-bytes"],
+    ],
+)
+def test_inspection_cli_missing_global_values_still_emit_safe_envelopes(capsys, root):
+    code = main(
+        [
+            *root,
+            "evidence-bundle",
+            "inspect",
+            "--project-id",
+            "p",
+            "--paper-id",
+            "paper",
+            "--query",
+            "PRIVATE-CANARY",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 2 and captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["outcome"] == "rejected" and payload["error"]["code"] == "INVALID_REQUEST"
+    assert payload["request_fingerprint"] is None and "bundle" not in payload
+    assert "PRIVATE" not in captured.out and "SECRET" not in captured.out
+
+
+def test_inspection_probe_consumes_option_values_and_ignores_other_command_arguments():
+    from academic_chatbot.cli import _is_inspection_invocation
+
+    assert not _is_inspection_invocation(
+        ["--data-root", "evidence-bundle", "inspect", "--max-pdf-bytes", "100"]
+    )
+    assert not _is_inspection_invocation(
+        [
+            "--data-root",
+            "C:/data",
+            "--max-pdf-bytes",
+            "100",
+            "search",
+            "--query",
+            "evidence-bundle",
+            "inspect",
+        ]
+    )
+    assert _is_inspection_invocation(
+        ["--data-root=inspect", "--max-pdf-bytes=100", "evidence-bundle", "inspect"]
+    )
