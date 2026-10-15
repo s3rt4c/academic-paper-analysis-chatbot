@@ -37,14 +37,18 @@ implemented; later sections remain design direction unless stated otherwise.
 ## Implemented MVP answer flow
 
 ```text
-single selected paper -> retrieval -> EvidenceBundle -> bounded context
+single selected paper -> current source admission -> scoped hybrid retrieval
+-> EvidenceBundle -> bounded context
 -> template/tokenizer admission -> local llama.cpp -> strict output
 -> citation validation -> currentness check -> CLI answer
 ```
 
 Source admission requires exactly one published current FileVersion for the
-selected paper. Retrieval hits are scoped to that paper and its admitted source
-before evidence preparation. Nonready evidence previews abstain before model
+selected paper. The same source-scoped service used by inspection applies the
+exact project/paper/FileVersion/DocumentGeneration tuple before each lexical
+and semantic cap, then performs unchanged hybrid fusion. It does not acquire
+project-wide top-k and filter afterward. Foreign or inconsistent returned
+lineage is an invariant failure. Nonready evidence previews abstain before model
 access. Paper text remains untrusted data inside the rendered context.
 
 The verified session renders the template, counts tokens, and generates with
@@ -52,6 +56,11 @@ one frozen runtime/model pair. Admission enforces rendered prompt tokens plus
 1024 reserved output tokens within the 4096-token context. Strict output must
 contain an answer and valid evidence citation labels. The service rebuilds the
 authoritative bundle and rechecks the selected source before releasing a result.
+The ask coordinator also rechecks the admitted semantic/vector publication and
+requires every released citation to match its authoritative bundle entry.
+Before abstention or generation, the coordinator validates the canonical bundle
+seal and binds source, origin, candidate/disposition order and preview budget to
+the acquired request using the existing inspection bundle validator.
 These checks validate references and currentness; they do not prove semantic
 entailment, evidence completeness, or factual correctness.
 
@@ -60,6 +69,38 @@ artifacts. It adds no persistence migration or dependency. It does not implement
 multi-paper synthesis, an API/UI, OCR execution, automatic five-status
 classification, or the broader staged-analysis design below. Acceptance evidence
 is recorded in [mvp-validation.md](mvp-validation.md).
+
+## Implemented V1.1 scoped inspection
+
+`search --paper-id` adds a selected-source request/result contract without
+changing project-wide search. Lexical eligibility is part of the SQL predicate
+before LIMIT. Semantic eligibility selects global vector rows before exact
+block top-k, using at most 4096 rows per block and the existing memmap store.
+Hybrid channel depths, weights, ordering and `rrf-v1` are unchanged.
+
+`evidence-bundle inspect` composes this acquisition with the existing
+EvidenceBundle resolver, packer and fingerprint authority. Its canonical
+`evidence-inspection-result-v1` envelope carries the bundle and bound retrieval
+identity, rather than a parallel evidence representation. Default preview
+limits are 8 entries and 16KiB. Ready/partial/insufficient are evidence states;
+rejected/failed envelopes suppress evidence on invalid or unavailable authority.
+Inspection revalidates source/vector currentness before releasing its envelope.
+
+Lexical inspection uses no embedding model. Semantic/hybrid inspection uses
+verified BGE artifacts; all inspection modes avoid answer generation and
+llama.cpp startup. `ask` uses that same scoped hybrid acquisition, with unchanged
+generation schemas, context rendering, 4096/1024 admission, strict output and
+citations. Source admission uses logical read-only SQLite transactions. Ordinary
+WAL snapshots can maintain SQLite sidecars; this contract does not promise
+byte-identical database-family files.
+
+Native coverage reports visible gaps and omissions, not exhaustive document
+coverage. Document and selected-source retrieval completeness are `not_assessed`;
+support assessment is `not_performed`. Multi-paper synthesis, semantic entailment
+certification, scientific factual verification, OCR execution, UI/API,
+conversation memory and automatic five-status decisions remain outside V1.1.
+See [v1.1-validation.md](v1.1-validation.md) for the tested functional inventory,
+Windows acceptance, measured fixture and public revision binding limitation.
 
 ## Intended local analysis flow
 

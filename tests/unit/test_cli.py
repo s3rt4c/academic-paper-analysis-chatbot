@@ -1053,3 +1053,42 @@ def test_inspection_probe_consumes_option_values_and_ignores_other_command_argum
     assert _is_inspection_invocation(
         ["--data-root=inspect", "--max-pdf-bytes=100", "evidence-bundle", "inspect"]
     )
+
+
+def test_v11_default_gate_skips_before_paths_and_is_independent_of_mvp(monkeypatch):
+    from pathlib import Path
+
+    from tests.integration.generation.test_v11_live import _PATH_ENV, _live_paths
+
+    monkeypatch.setenv("ACADEMIC_CHATBOT_RUN_MVP_LLAMA_CPP", "1")
+    monkeypatch.setenv("ACADEMIC_CHATBOT_RUN_V11_LLAMA_CPP", "0")
+    for name in _PATH_ENV.values():
+        monkeypatch.setenv(name, "invalid")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("default gate touched artifacts")
+
+    monkeypatch.setattr(Path, "is_absolute", forbidden)
+    with pytest.raises(pytest.skip.Exception):
+        _live_paths()
+
+
+@pytest.mark.parametrize("damage", ["missing", "relative", "wrong_kind"])
+def test_v11_opt_in_artifact_configuration_errors_are_failures(tmp_path, monkeypatch, damage):
+    from tests.integration.generation.test_v11_live import _DIRECTORIES, _PATH_ENV, _live_paths
+
+    monkeypatch.setenv("ACADEMIC_CHATBOT_RUN_V11_LLAMA_CPP", "1")
+    monkeypatch.setenv("ACADEMIC_CHATBOT_RUN_MVP_LLAMA_CPP", "0")
+    for role, name in _PATH_ENV.items():
+        path = tmp_path / role
+        path.mkdir() if role in _DIRECTORIES else path.write_text("synthetic")
+        monkeypatch.setenv(name, str(path))
+    name = _PATH_ENV["model"]
+    if damage == "missing":
+        monkeypatch.delenv(name)
+    elif damage == "relative":
+        monkeypatch.setenv(name, "relative")
+    else:
+        monkeypatch.setenv(name, str(tmp_path))
+    with pytest.raises(pytest.fail.Exception):
+        _live_paths()
