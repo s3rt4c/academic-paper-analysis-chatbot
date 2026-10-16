@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import socket
 import sqlite3
@@ -8,15 +9,18 @@ from pathlib import Path
 
 from academic_chatbot import cli
 from academic_chatbot.embeddings.profile import approved_bge_small_en_v15_profile
-from academic_chatbot.embeddings.repository import EmbeddingRepository
 from academic_chatbot.evidence.resolver import EvidenceReadResolver
 from academic_chatbot.evidence.service import EvidenceBundleService
 from academic_chatbot.generation.orchestrator import SinglePaperAskService
 from academic_chatbot.generation.service import LocalGenerationService
 from academic_chatbot.library.repository import ProjectRepository
 from academic_chatbot.ports.model import ModelTimings, StructuredGenerationResult
-from academic_chatbot.retrieval.hybrid_models import HybridRetrievalResults
-from academic_chatbot.retrieval.hybrid_service import HybridRetrievalService
+from academic_chatbot.retrieval.scoped_models import (
+    ScopedChannel,
+    ScopedChannels,
+    ScopedHybridResult,
+)
+from academic_chatbot.retrieval.scoped_service import SourceScopedRetrievalService
 from academic_chatbot.storage.paths import ProjectPaths
 from tests.e2e.test_native_semantic_retrieval import _ManifestFake, _OfflineFake
 from tests.fixtures.evidence_bundle.pdfs import write_pdf
@@ -33,28 +37,27 @@ class _FakeModel:
             self.during()
         return StructuredGenerationResult(
             content=(
-                '{"answer":"The study evaluates a synthetic objective.",'
-                '"citation_labels":["E1"]}'
+                '{"answer":"The study evaluates a synthetic objective.","citation_labels":["E1"]}'
             ),
             prompt_tokens=100,
             completion_tokens=12,
             total_tokens=112,
-            timings=ModelTimings(
-                first_token_ms=1.0, total_ms=2.0, tokens_per_second=6.0
-            ),
+            timings=ModelTimings(first_token_ms=1.0, total_ms=2.0, tokens_per_second=6.0),
         )
 
 
-class _EmptyRetrieval:
-    def search(self, project, query: str, limit: int = 10):
-        return HybridRetrievalResults(
-            project_id=project.project_id,
-            query=query,
-            fusion_profile_id="rrf-v1",
-            lexical_state="healthy_empty",
-            semantic_state="healthy_empty",
-            hits=(),
-        )
+def _empty_result(self, request):
+    channel = ScopedChannel(state="empty", requested_limit=50, returned_count=0)
+    return ScopedHybridResult(
+        request_fingerprint=request.fingerprint,
+        source=request.scope,
+        query=request.query,
+        limit=request.limit,
+        policy=request.policy,
+        semantic_identity=request.semantic_identity,
+        channels=ScopedChannels(lexical=channel, semantic=channel),
+        hits=(),
+    )
 
 
 def _disable_external_io(monkeypatch) -> None:
@@ -75,16 +78,13 @@ def _install_embedding_fakes(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "load_verified_artifacts", artifacts)
     monkeypatch.setattr(cli, "OfflineEmbedder", _OfflineFake)
-    monkeypatch.setattr(
-        "academic_chatbot.retrieval.semantic.load_verified_artifacts", artifacts
-    )
-    monkeypatch.setattr(
-        "academic_chatbot.retrieval.semantic.OfflineEmbedder", _OfflineFake
-    )
+    monkeypatch.setattr("academic_chatbot.retrieval.semantic.load_verified_artifacts", artifacts)
+    monkeypatch.setattr("academic_chatbot.retrieval.semantic.OfflineEmbedder", _OfflineFake)
 
 
 def _setup_project(tmp_path: Path, monkeypatch, capsys) -> tuple[Path, list[str]]:
     _install_embedding_fakes(monkeypatch)
+    (tmp_path / "embedding").mkdir()
     data_root = tmp_path / "data"
     source = write_pdf(
         tmp_path / "synthetic.pdf",
@@ -96,32 +96,38 @@ def _setup_project(tmp_path: Path, monkeypatch, capsys) -> tuple[Path, list[str]
     root = ["--data-root", str(data_root), "--max-pdf-bytes", "1000000"]
     assert cli.main([*root, "project", "create", "--project-id", "p", "--display-name", "P"]) == 0
     assert cli.main([*root, "paper", "create", "--project-id", "p", "--paper-id", "paper"]) == 0
-    assert cli.main(
-        [
-            *root,
-            "import-pdf",
-            "--project-id",
-            "p",
-            "--paper-id",
-            "paper",
-            "--source",
-            str(source),
-        ]
-    ) == 0
+    assert (
+        cli.main(
+            [
+                *root,
+                "import-pdf",
+                "--project-id",
+                "p",
+                "--paper-id",
+                "paper",
+                "--source",
+                str(source),
+            ]
+        )
+        == 0
+    )
     profile = approved_bge_small_en_v15_profile()
-    assert cli.main(
-        [
-            *root,
-            "semantic-index",
-            "build",
-            "--project-id",
-            "p",
-            "--embedding-profile-id",
-            profile.embedding_profile_id,
-            "--model-root",
-            str(tmp_path / "embedding"),
-        ]
-    ) == 0
+    assert (
+        cli.main(
+            [
+                *root,
+                "semantic-index",
+                "build",
+                "--project-id",
+                "p",
+                "--embedding-profile-id",
+                profile.embedding_profile_id,
+                "--model-root",
+                str(tmp_path / "embedding"),
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     return data_root, root
 
@@ -154,25 +160,18 @@ def _ask_arguments(tmp_path: Path, root: list[str]) -> list[str]:
 
 def _service(data_root: Path, args, model, *, retrieval=None):
     paths = ProjectPaths.create(data_root, project_id=args.project_id)
-    active = EmbeddingRepository(paths).active_generation(
-        project_id=args.project_id,
-        embedding_profile_id=args.embedding_profile_id,
-    )
-    assert active is not None
     resolver = EvidenceReadResolver(data_root=data_root)
     return SinglePaperAskService(
         repository=ProjectRepository(paths),
         retrieval=retrieval
-        or HybridRetrievalService.open_from_model_root(
-            data_root=data_root,
-            project_id=args.project_id,
-            profile_id=args.embedding_profile_id,
-            model_root=Path(args.embedding_model_root),
+        or cli._build_scoped_retrieval(
+            argparse.Namespace(
+                **vars(args), mode="hybrid", model_root=args.embedding_model_root
+            )
         ),
         evidence=EvidenceBundleService(resolver=resolver),
         generation=LocalGenerationService(resolver=resolver, model=model),
         embedding_profile_id=args.embedding_profile_id,
-        vector_generation_id=active.vector_generation_id,
     )
 
 
@@ -202,15 +201,14 @@ def test_offline_cli_ask_completes_current_cited_vertical_slice(
     assert any("ignore policy" in item["text"] for item in user_payload["evidence"])
 
 
-def test_insufficient_evidence_never_invokes_model(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_insufficient_evidence_never_invokes_model(tmp_path: Path, monkeypatch, capsys) -> None:
     data_root, root = _setup_project(tmp_path, monkeypatch, capsys)
     model = _FakeModel()
+    monkeypatch.setattr(SourceScopedRetrievalService, "search_scoped", _empty_result)
     monkeypatch.setattr(
         cli,
         "_build_ask_service",
-        lambda args: _service(data_root, args, model, retrieval=_EmptyRetrieval()),
+        lambda args: _service(data_root, args, model),
     )
     _disable_external_io(monkeypatch)
 
@@ -260,12 +258,8 @@ def test_production_builder_resolves_unpublished_paper_before_artifacts(
 ) -> None:
     data_root = tmp_path / "data"
     root = ["--data-root", str(data_root), "--max-pdf-bytes", "1000000"]
-    assert cli.main(
-        [*root, "project", "create", "--project-id", "p", "--display-name", "P"]
-    ) == 0
-    assert cli.main(
-        [*root, "paper", "create", "--project-id", "p", "--paper-id", "paper"]
-    ) == 0
+    assert cli.main([*root, "project", "create", "--project-id", "p", "--display-name", "P"]) == 0
+    assert cli.main([*root, "paper", "create", "--project-id", "p", "--paper-id", "paper"]) == 0
     capsys.readouterr()
 
     class ForbiddenEmbeddingRepository:
@@ -286,9 +280,9 @@ def test_production_builder_abstains_before_missing_runtime_artifacts(
 ) -> None:
     _data_root, root = _setup_project(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(
-        cli.HybridRetrievalService,
-        "open_from_model_root",
-        lambda **_kwargs: _EmptyRetrieval(),
+        SourceScopedRetrievalService,
+        "search_scoped",
+        _empty_result,
     )
 
     assert cli.main(_ask_arguments(tmp_path, root)) == 3
