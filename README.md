@@ -38,6 +38,14 @@ citation, and abstains from scalar projection for `EvidenceGroup` values.
 acceptance from this public checkout are recorded in
 [the MVP validation record](docs/mvp-validation.md).
 
+**V1.1 — source-scoped retrieval, evidence inspection and ask integration:
+implemented and validated on Windows.** Selected-source eligibility precedes
+both retrieval channel caps. Inspection exposes the existing EvidenceBundle
+without answer generation, and `ask` shares that scoped acquisition path.
+[The V1.1 validation record](docs/v1.1-validation.md) binds these results to a
+tested functional inventory; public revision binding requires a separate
+projection and revalidation.
+
 ## What Phase 0 validates
 
 - Reproducible Python packaging and strict test/tool configuration.
@@ -125,7 +133,7 @@ support classification, or generation readiness.
 ## What the implemented MVP provides
 
 - One explicitly selected paper and one question through the local `ask` CLI.
-- Existing hybrid retrieval followed by an authoritative EvidenceBundle and
+- Source-scoped hybrid retrieval followed by an authoritative EvidenceBundle and
   trusted/untrusted context rendering.
 - Exact template rendering and tokenizer admission on the same verified local
   `llama.cpp` session: a 4096-token context with 1024 tokens reserved for output.
@@ -143,6 +151,40 @@ correctness. Multi-paper synthesis, a UI/API, OCR execution, automatic
 five-status classification, and general production readiness remain outside
 this frozen MVP. See [the validation record](docs/mvp-validation.md) for the
 measured scope and limitations.
+
+## What V1.1 provides
+
+- `search --paper-id` selects one authoritative current paper source before
+  lexical SQL limits, semantic block top-k and hybrid fusion. Omitting the flag
+  preserves project-wide search. Ranking policy and `rrf-v1` remain unchanged.
+- `evidence-bundle inspect` returns canonical `evidence-inspection-result-v1`
+  JSON with `ready`, `partial`, `insufficient`, `rejected` or `failed` outcomes.
+  It wraps the existing EvidenceBundle, including source identities, evidence
+  labels, ranges, anchors, omissions and native coverage information.
+- Lexical inspection needs no embedding model. Semantic/hybrid inspection uses
+  the verified local BGE model and current vector publication, but never starts
+  Qwen or llama.cpp. It is generation-free.
+- `ask` uses scoped hybrid retrieval with limit10 and the same default evidence
+  budget as inspection: 8 entries and 16KiB of preview content. Foreign lineage
+  fails closed. Partial/insufficient evidence abstains before model access.
+- Fresh source/vector checks suppress stale results; strict answer/citation and
+  template/tokenizer contracts remain unchanged. Ask exits 0 for answered,
+  3 for abstained and 2 for rejected/failed. Inspection exits 0 for ready/partial,
+  3 for insufficient and 2 for rejected/failed.
+
+For example, using an absolute local data root and an already imported paper:
+
+```powershell
+python -m academic_chatbot --data-root <ABSOLUTE_DATA_ROOT> --max-pdf-bytes 1000000 search --project-id p --paper-id selected --query "study objective" --mode lexical --limit 10
+python -m academic_chatbot --data-root <ABSOLUTE_DATA_ROOT> --max-pdf-bytes 1000000 evidence-bundle inspect --project-id p --paper-id selected --query "study objective" --mode lexical
+```
+
+For semantic or hybrid modes, additionally provide `--embedding-profile-id`
+and `--model-root` pointing to verified BGE artifacts. Inspection accepts bounded
+`--preview-entries` and `--preview-bytes` overrides. These are evidence previews:
+document/retrieval completeness remain `not_assessed`, and support assessment
+remains `not_performed`. Native coverage flags and valid citations do not prove
+scientific correctness, semantic entailment or exhaustive retrieval.
 
 ## Architecture direction
 

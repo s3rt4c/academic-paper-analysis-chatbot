@@ -64,7 +64,6 @@ from academic_chatbot.ports.model import (
     StructuredGenerationResult,
 )
 from academic_chatbot.retrieval.fts import RetrievalQueryError
-from academic_chatbot.retrieval.hybrid_models import HybridRetrievalResults
 from academic_chatbot.retrieval.hybrid_service import (
     HybridRetrievalIntegrityError,
     HybridRetrievalService,
@@ -388,23 +387,13 @@ def _build_ask_service(arguments: argparse.Namespace) -> SinglePaperAskService:
     paths = ProjectPaths.create(data_root, project_id=arguments.project_id)
     resolver = EvidenceReadResolver(data_root=data_root)
 
-    def current_vector_generation_id() -> str:
-        vector_generation = EmbeddingRepository(paths).active_generation(
-            project_id=arguments.project_id,
-            embedding_profile_id=arguments.embedding_profile_id,
-        )
-        if vector_generation is None:
-            raise SemanticIndexUnavailableError("semantic index is unavailable")
-        return vector_generation.vector_generation_id
+    scoped_arguments = argparse.Namespace(**vars(arguments))
+    scoped_arguments.mode = "hybrid"
+    scoped_arguments.model_root = arguments.embedding_model_root
 
     return SinglePaperAskService(
         repository=ProjectRepository(paths),
-        retrieval=_LazyHybridRetrieval(
-            data_root=data_root,
-            project_id=arguments.project_id,
-            profile_id=arguments.embedding_profile_id,
-            model_root=Path(arguments.embedding_model_root),
-        ),
+        retrieval=_build_scoped_retrieval(scoped_arguments),
         evidence=EvidenceBundleService(resolver=resolver),
         generation=LocalGenerationService(
             resolver=resolver,
@@ -416,35 +405,7 @@ def _build_ask_service(arguments: argparse.Namespace) -> SinglePaperAskService:
             ),
         ),
         embedding_profile_id=arguments.embedding_profile_id,
-        vector_generation_id=current_vector_generation_id,
     )
-
-
-class _LazyHybridRetrieval:
-    """Open embedding artifacts only after the selected source is admitted."""
-
-    def __init__(
-        self,
-        *,
-        data_root: Path,
-        project_id: str,
-        profile_id: str,
-        model_root: Path,
-    ) -> None:
-        self._data_root = data_root
-        self._project_id = project_id
-        self._profile_id = profile_id
-        self._model_root = model_root
-
-    def search(self, project: Project, query: str, limit: int = 10) -> HybridRetrievalResults:
-        if project.project_id != self._project_id:
-            raise HybridRetrievalIntegrityError("project scope changed")
-        return HybridRetrievalService.open_from_model_root(
-            data_root=self._data_root,
-            project_id=self._project_id,
-            profile_id=self._profile_id,
-            model_root=self._model_root,
-        ).search(project, query, limit=limit)
 
 
 class _LazyVerifiedLlamaCppModel:

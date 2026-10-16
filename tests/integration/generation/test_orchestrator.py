@@ -20,8 +20,9 @@ from academic_chatbot.library.repository import (
     UnknownPaperError,
 )
 from academic_chatbot.library.service import LibraryService
-from academic_chatbot.retrieval.hybrid_service import HybridRetrievalService
+from academic_chatbot.retrieval.scoped_service import SourceScopedRetrievalService
 from academic_chatbot.retrieval.semantic import SemanticRetrievalService
+from academic_chatbot.retrieval.service import RetrievalService
 from tests.fixtures.evidence_bundle.database import _SyntheticQueryEmbedder, database
 from tests.fixtures.evidence_bundle.pdfs import write_pdf
 from tests.integration.embeddings.test_vector_publication import _profile
@@ -78,16 +79,15 @@ def _actual_service(db, generation):
     )
     return SinglePaperAskService(
         repository=ProjectRepository(db.paths),
-        retrieval=HybridRetrievalService(
+        retrieval=SourceScopedRetrievalService(
             data_root=db.paths.data_root,
             semantic_service=semantic,
+            repository=ProjectRepository(db.paths),
+            lexical_service=RetrievalService(data_root=db.paths.data_root),
         ),
-        evidence=EvidenceBundleService(
-            resolver=EvidenceReadResolver(data_root=db.paths.data_root)
-        ),
+        evidence=EvidenceBundleService(resolver=EvidenceReadResolver(data_root=db.paths.data_root)),
         generation=generation,
         embedding_profile_id=prepared.origin.embedding_profile_id,
-        vector_generation_id=prepared.origin.vector_generation_id,
     )
 
 
@@ -106,15 +106,11 @@ def test_repository_distinguishes_missing_stale_and_ambiguous(tmp_path: Path) ->
     missing = database(tmp_path / "missing")
     repository = ProjectRepository(missing.paths)
     with pytest.raises(UnknownPaperError):
-        repository.sole_current_paper_source(
-            project_id="project-one", paper_id="paper-missing"
-        )
+        repository.sole_current_paper_source(project_id="project-one", paper_id="paper-missing")
 
     missing.execute("DELETE FROM generation_publications")
     with pytest.raises(PaperSourceNotCurrentError):
-        repository.sole_current_paper_source(
-            project_id="project-one", paper_id="paper-one"
-        )
+        repository.sole_current_paper_source(project_id="project-one", paper_id="paper-one")
 
     ambiguous = database(tmp_path / "ambiguous", older=True)
     with pytest.raises(PaperSourceAmbiguousError):
