@@ -42,8 +42,11 @@ class VectorOpenLimits:
 
     def __post_init__(self) -> None:
         for value in (
-            self.max_manifest_bytes, self.max_metadata_bytes, self.max_vectors_file_bytes,
-            self.max_rows, self.expected_dimension,
+            self.max_manifest_bytes,
+            self.max_metadata_bytes,
+            self.max_vectors_file_bytes,
+            self.max_rows,
+            self.expected_dimension,
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError("Vector opening limits must be strictly positive integers")
@@ -76,8 +79,11 @@ def _file_state(state: os.stat_result) -> tuple[int, int, int, int]:
 def _assert_file_unchanged(handle: BinaryIO, path: Path, initial: os.stat_result) -> None:
     expected = _file_state(initial)
     current = os.fstat(handle.fileno())
-    if (_file_state(current) != expected or current.st_ctime_ns != initial.st_ctime_ns
-            or _file_state(path.stat()) != expected):
+    if (
+        _file_state(current) != expected
+        or current.st_ctime_ns != initial.st_ctime_ns
+        or _file_state(path.stat()) != expected
+    ):
         raise ValueError("Artifact changed during bounded verification")
 
 
@@ -112,7 +118,10 @@ def _hash_bounded_stream(handle: BinaryIO, maximum: int) -> tuple[str, int]:
 
 
 def _read_bounded_npy_header(
-    handle: BinaryIO, *, max_header_bytes: int, file_bytes: int | None = None,
+    handle: BinaryIO,
+    *,
+    max_header_bytes: int,
+    file_bytes: int | None = None,
 ) -> tuple[tuple[int, ...], bool, np.dtype[Any], int]:
     if np.lib.format.read_magic(handle) != _NPY_VERSION:
         raise ValueError("vectors.npy must use NPY version 2.0")
@@ -130,7 +139,8 @@ def _read_bounded_npy_header(
     # NumPy parses only the already-admitted in-memory header bytes. The payload
     # is never handed to an unrestricted np.load or a second disk header parser.
     shape, order, dtype = np.lib.format.read_array_header_2_0(
-        BytesIO(encoded_length + body), max_header_size=max_header_bytes,
+        BytesIO(encoded_length + body),
+        max_header_size=max_header_bytes,
     )
     return shape, order, dtype, 12 + length
 
@@ -181,9 +191,7 @@ def _generation_identity_payload(
         "dimension": dimension,
         "dtype": "<f2",
         "metadata_sha256": metadata_sha256,
-        "normalization_policy": _normalization_identity(
-            normalization_atol=normalization_atol
-        ),
+        "normalization_policy": _normalization_identity(normalization_atol=normalization_atol),
         "npy_version": "2.0",
         "order": "C",
         "profile_sha256": profile_sha256,
@@ -222,9 +230,7 @@ class VectorGenerationManifest(BaseModel):
             raise ValueError("normalization_atol must be finite")
         expected_payload_bytes = self.row_count * self.dimension * 2
         if self.vector_payload_bytes != expected_payload_bytes:
-            raise ValueError(
-                "vector_payload_bytes does not match row_count, dimension, and dtype"
-            )
+            raise ValueError("vector_payload_bytes does not match row_count, dimension, and dtype")
         identity_payload = _generation_identity_payload(
             vectors_sha256=self.vectors_sha256,
             metadata_sha256=self.metadata_sha256,
@@ -235,15 +241,11 @@ class VectorGenerationManifest(BaseModel):
         )
         expected_generation_id = f"sha256-{_canonical_sha256(identity_payload)}"
         if not hmac.compare_digest(self.generation_id, expected_generation_id):
-            raise ValueError(
-                "generation_id does not match the canonical generation identity"
-            )
+            raise ValueError("generation_id does not match the canonical generation identity")
         manifest_payload = self.model_dump(mode="json", exclude={"manifest_sha256"})
         expected_manifest_hash = _canonical_sha256(manifest_payload)
         if not hmac.compare_digest(self.manifest_sha256, expected_manifest_hash):
-            raise ValueError(
-                "manifest_sha256 does not match the canonical manifest payload"
-            )
+            raise ValueError("manifest_sha256 does not match the canonical manifest payload")
         return self
 
 
@@ -341,9 +343,7 @@ def _validate_build_inputs(
         raise ValueError("normalization_atol must be finite and positive")
     deviations = np.abs(squared_norms - np.float32(1.0))
     if not bool(np.all(deviations <= normalization_atol)):
-        raise ValueError(
-            "rows must be row-wise L2-normalized within normalization_atol"
-        )
+        raise ValueError("rows must be row-wise L2-normalized within normalization_atol")
     if _SHA256_RE.fullmatch(profile_sha256) is None:
         raise ValueError("profile_sha256 must be a lowercase SHA-256 digest")
 
@@ -585,7 +585,9 @@ class ExactVectorStore:
                     raise ValueError("vectors.npy SHA-256 does not match the manifest")
                 handle.seek(0)
                 shape, order, dtype, offset = _read_bounded_npy_header(
-                    handle, max_header_bytes=limits.max_manifest_bytes, file_bytes=size,
+                    handle,
+                    max_header_bytes=limits.max_manifest_bytes,
+                    file_bytes=size,
                 )
                 if shape != (manifest.row_count, manifest.dimension):
                     raise ValueError("vectors.npy shape does not match the manifest")
@@ -600,8 +602,9 @@ class ExactVectorStore:
 
                 # Map the SAME open file descriptor that was hashed, using only
                 # validated dtype/shape/offset. No path reopen or header reread.
-                mapping = np.memmap(handle, dtype=dtype, mode="r", offset=offset, shape=shape,
-                                    order="C")
+                mapping = np.memmap(
+                    handle, dtype=dtype, mode="r", offset=offset, shape=shape, order="C"
+                )
                 if mapping.shape != shape or mapping.dtype.str != manifest.dtype:
                     raise ValueError("Mapped vectors do not match the validated header")
                 if mapping.flags.writeable or not mapping.flags.c_contiguous:
@@ -610,8 +613,12 @@ class ExactVectorStore:
                     raise ValueError("vectors.npy must contain only finite values")
                 for opened, path, initial in files:
                     _assert_file_unchanged(opened, path, initial)
-            return cls(generation_dir=generation_dir, manifest=manifest,
-                       row_ids=metadata.row_ids, vectors=mapping)
+            return cls(
+                generation_dir=generation_dir,
+                manifest=manifest,
+                row_ids=metadata.row_ids,
+                vectors=mapping,
+            )
         except BaseException:
             if mapping is not None:
                 with suppress(BaseException):
@@ -627,14 +634,10 @@ class ExactVectorStore:
         try:
             existing = cls.open(generation_dir)
         except (OSError, ValueError) as error:
-            raise ValueError(
-                "Existing generation does not match the expected content."
-            ) from error
+            raise ValueError("Existing generation does not match the expected content.") from error
         if existing.manifest != expected_manifest:
             existing.close()
-            raise ValueError(
-                "Existing generation does not match the expected content."
-            )
+            raise ValueError("Existing generation does not match the expected content.")
         return existing
 
     @classmethod
@@ -674,9 +677,7 @@ class ExactVectorStore:
             raise ValueError("vectors.meta.json file size does not match the manifest")
         if not hmac.compare_digest(_file_sha256(vectors_path), manifest.vectors_sha256):
             raise ValueError("vectors.npy SHA-256 does not match the manifest")
-        if not hmac.compare_digest(
-            _file_sha256(metadata_path), manifest.metadata_sha256
-        ):
+        if not hmac.compare_digest(_file_sha256(metadata_path), manifest.metadata_sha256):
             raise ValueError("vectors.meta.json SHA-256 does not match the manifest")
 
         metadata_payload = _load_json_object(metadata_path)
@@ -734,11 +735,7 @@ class ExactVectorStore:
         self._ensure_open()
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise ValueError("limit must be positive")
-        if (
-            isinstance(block_rows, bool)
-            or not isinstance(block_rows, int)
-            or block_rows <= 0
-        ):
+        if isinstance(block_rows, bool) or not isinstance(block_rows, int) or block_rows <= 0:
             raise ValueError("block_rows must be positive")
         if not isinstance(query, np.ndarray) or query.dtype != np.dtype(np.float32):
             raise TypeError("query must have dtype float32")
@@ -780,6 +777,74 @@ class ExactVectorStore:
             )
             best.sort(key=lambda hit: (-hit.score, hit.vector_row))
             del best[result_limit:]
+            del scores
+            del float32_block
+        return tuple(best)
+
+    def search_eligible(
+        self,
+        query: NDArray[np.float32],
+        *,
+        eligible_rows: tuple[int, ...],
+        limit: int,
+        block_rows: int = 4096,
+    ) -> tuple[VectorHit, ...]:
+        """Compete only eligible GLOBAL rows, using the original contiguous blocks."""
+        from bisect import bisect_left
+        from itertools import pairwise
+
+        self._ensure_open()
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("invalid scoped limit")
+        if type(block_rows) is not int or not 1 <= block_rows <= 4096:
+            raise ValueError("invalid scoped block size")
+        if (
+            type(eligible_rows) is not tuple
+            or len(eligible_rows) > 100000
+            or any(
+                type(row) is not int or not 0 <= row < self.manifest.row_count
+                for row in eligible_rows
+            )
+            or any(a >= b for a, b in pairwise(eligible_rows))
+        ):
+            raise ValueError("eligible global rows must be bounded, sorted and unique")
+        if not isinstance(query, np.ndarray) or query.dtype != np.dtype(np.float32):
+            raise TypeError("query must have dtype float32")
+        if (
+            query.ndim != 1
+            or query.shape[0] != self.manifest.dimension
+            or not bool(np.isfinite(query).all())
+        ):
+            raise ValueError("invalid scoped query vector")
+        normalized_query = query.copy(order="C")
+        query_scale = np.max(np.abs(normalized_query))
+        if query_scale == np.float32(0.0):
+            raise ValueError("query must be non-zero")
+        normalized_query /= query_scale
+        norm_squared = np.dot(normalized_query, normalized_query)
+        normalized_query /= np.sqrt(norm_squared)
+        best: list[VectorHit] = []
+        for start in range(0, self.manifest.row_count, block_rows):
+            stop = min(start + block_rows, self.manifest.row_count)
+            first, last = bisect_left(eligible_rows, start), bisect_left(eligible_rows, stop)
+            if first == last:
+                continue
+            float32_block = self._vectors[start:stop].astype(np.float32, copy=True)
+            scores = np.einsum(
+                "ij,j->i",
+                float32_block,
+                normalized_query,
+                dtype=np.float32,
+                optimize=False,
+            )
+            best.extend(
+                VectorHit(
+                    row_id=self.row_ids[row], score=float(scores[row - start]), vector_row=row
+                )
+                for row in eligible_rows[first:last]
+            )
+            best.sort(key=lambda hit: (-hit.score, hit.vector_row))
+            del best[limit:]
             del scores
             del float32_block
         return tuple(best)

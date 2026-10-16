@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from academic_chatbot.evidence.models import BundleSourceScope
+    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalRequest
 
 from academic_chatbot.db.connection import DatabasePathError, open_read_only_connection
 from academic_chatbot.domain.library import Project
@@ -73,6 +77,14 @@ class _PositionalSemanticSearch(Protocol):
     ) -> SemanticPositionalAcquisition: ...
 
 
+class _ScopedLexicalSearch(Protocol):
+    def search_scoped(self, request: ScopedRetrievalRequest) -> RetrievalResults: ...
+
+
+class _ScopedSemanticSearch(Protocol):
+    def search_scoped(self, request: ScopedRetrievalRequest) -> SemanticRetrievalResults: ...
+
+
 class _ParentResolver(Protocol):
     def resolve(
         self, project: Project, candidate: FusedHybridCandidate
@@ -90,6 +102,7 @@ class HybridRetrievalService:
         lexical_service: _LexicalSearch | None = None,
         parent_resolver: _ParentResolver | None = None,
     ) -> None:
+        self._scoped_data_root = Path(data_root)
         self._data_root = Path(data_root).resolve(strict=False)
         self._lexical = lexical_service or RetrievalService(data_root=self._data_root)
         self._semantic = semantic_service
@@ -110,6 +123,89 @@ class HybridRetrievalService:
                 model_root=model_root,
             ),
         )
+
+    def search_scoped(self, request: ScopedRetrievalRequest) -> HybridRetrievalResults:
+        return self._acquire_scoped(request)[0]
+
+    def _acquire_scoped(
+        self,
+        request: ScopedRetrievalRequest,
+    ) -> tuple[HybridRetrievalResults, int, int]:
+        """Keep per-channel acquisition counts local; never cache publication identity."""
+        from pydantic import ValidationError
+
+        from academic_chatbot.library.repository import guard_scoped_database
+        from academic_chatbot.retrieval.scoped_models import (
+            ScopedRetrievalError,
+            ScopedRetrievalRequest,
+            policy_for,
+            validate_hit_scope,
+        )
+
+        try:
+            request = ScopedRetrievalRequest.model_validate(request)
+        except ValidationError:
+            raise ScopedRetrievalError("INVALID_REQUEST") from None
+        if request.mode != "hybrid":
+            raise ScopedRetrievalError("INVALID_REQUEST")
+        guard_scoped_database(self._scoped_data_root, request.scope.project_id)
+        depth = candidate_limit(request.limit)
+        lexical_request = ScopedRetrievalRequest(
+            scope=request.scope,
+            query=request.query,
+            mode="lexical",
+            limit=depth,
+            policy=policy_for("lexical"),
+            semantic_identity=None,
+        )
+        semantic_request = ScopedRetrievalRequest(
+            scope=request.scope,
+            query=request.query,
+            mode="semantic",
+            limit=depth,
+            policy=policy_for("semantic"),
+            semantic_identity=request.semantic_identity,
+        )
+        try:
+            lexical = cast(_ScopedLexicalSearch, self._lexical).search_scoped(lexical_request)
+            semantic = cast(_ScopedSemanticSearch, self._semantic).search_scoped(semantic_request)
+            project = Project(project_id=request.scope.project_id, display_name="scoped retrieval")
+            _validate_channel_results(project, request.query, lexical, semantic)
+            if len(lexical.hits) > depth or len(semantic.hits) > depth:
+                raise ScopedRetrievalError("INTERNAL_INVARIANT_FAILURE")
+            for lexical_packet in lexical.hits:
+                validate_hit_scope(lexical_packet, request.scope, request.semantic_identity)
+            for semantic_packet in semantic.hits:
+                validate_hit_scope(semantic_packet, request.scope, request.semantic_identity)
+            fused = fuse_candidates(lexical.hits, semantic.hits, final_limit=request.limit)
+            hits = []
+            for candidate in fused:
+                if isinstance(self._resolver, _ParentChunkEvidenceResolver):
+                    parent = self._resolver._resolve(project, candidate, scope=request.scope)
+                else:
+                    parent = self._resolver.resolve(project, candidate)
+                hit = HybridRetrievalHit(
+                    identity=candidate.identity,
+                    parent_chunk=parent,
+                    lexical_contribution=candidate.lexical_contribution,
+                    semantic_contribution=candidate.semantic_contribution,
+                    trace=candidate.trace,
+                )
+                validate_hit_scope(hit, request.scope, request.semantic_identity)
+                hits.append(hit)
+            result = HybridRetrievalResults(
+                project_id=project.project_id,
+                query=request.query,
+                fusion_profile_id="rrf-v1",
+                lexical_state=_state_for(lexical.hits),
+                semantic_state=_state_for(semantic.hits),
+                hits=tuple(hits),
+            )
+            return result, len(lexical.hits), len(semantic.hits)
+        except ScopedRetrievalError:
+            raise
+        except (HybridRetrievalIntegrityError, ValueError, AttributeError):
+            raise ScopedRetrievalError("INTERNAL_INVARIANT_FAILURE") from None
 
     def search(
         self,
@@ -186,8 +282,22 @@ class _ParentChunkEvidenceResolver:
     def resolve(
         self, project: Project, candidate: FusedHybridCandidate
     ) -> HybridParentChunkContext:
+        return self._resolve(project, candidate)
+
+    def _resolve(
+        self,
+        project: Project,
+        candidate: FusedHybridCandidate,
+        *,
+        scope: BundleSourceScope | None = None,
+    ) -> HybridParentChunkContext:
         _validate_candidate_packets(candidate)
-        paths = ProjectPaths.create(self._data_root, project_id=project.project_id)
+        if scope is not None:
+            from academic_chatbot.library.repository import guard_scoped_database
+
+            paths = guard_scoped_database(self._data_root, project.project_id)
+        else:
+            paths = ProjectPaths.create(self._data_root, project_id=project.project_id)
         try:
             connection = open_read_only_connection(paths.database_path, data_root=self._data_root)
         except DatabasePathError as error:
@@ -197,8 +307,47 @@ class _ParentChunkEvidenceResolver:
         try:
             connection.execute("BEGIN")
             if candidate.semantic_contribution is not None:
+                max_rows = None
+                if scope is not None:
+                    from academic_chatbot.evidence.models import MAX_SOURCE_SNAPSHOT_ROWS
+
+                    max_rows = MAX_SOURCE_SNAPSHOT_ROWS
                 _require_current_semantic_generation(
-                    connection, project, candidate.semantic_contribution.semantic_hit
+                    connection,
+                    project,
+                    candidate.semantic_contribution.semantic_hit,
+                    max_rows=max_rows,
+                )
+            if scope is not None:
+                from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+                from academic_chatbot.retrieval.service import preflight_scoped_evidence
+
+                metadata_sql = (
+                    "SELECT pages.page_id, chunks.chunk_id, chunks.start_offset, chunks.end_offset "
+                    + "FROM chunks"
+                    + _PARENT_CHUNK_SQL.partition("FROM chunks")[2]
+                    + " AND papers.paper_id=? AND file_versions.file_version_id=? LIMIT 2"
+                )
+                metadata = connection.execute(
+                    metadata_sql,
+                    (
+                        project.project_id,
+                        candidate.identity.document_generation_id,
+                        candidate.identity.page_id,
+                        candidate.identity.chunk_id,
+                        scope.paper_id,
+                        scope.file_version_id,
+                    ),
+                ).fetchall()
+                if len(metadata) != 1:
+                    raise ScopedRetrievalError("SOURCE_NOT_CURRENT")
+                row_metadata = metadata[0]
+                preflight_scoped_evidence(
+                    connection,
+                    page_id=row_metadata[0],
+                    chunk_id=row_metadata[1],
+                    start=row_metadata[2],
+                    end=row_metadata[3],
                 )
             row = connection.execute(
                 _PARENT_CHUNK_SQL,
@@ -226,6 +375,11 @@ class _ParentChunkEvidenceResolver:
                 "parent evidence database state is invalid"
             ) from error
         except (KeyError, TypeError, ValueError) as error:
+            if scope is not None:
+                from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+                if isinstance(error, ScopedRetrievalError):
+                    raise
             raise HybridRetrievalIntegrityError("parent evidence is malformed") from error
         finally:
             connection.rollback()
@@ -259,7 +413,11 @@ def _validate_candidate_packets(candidate: FusedHybridCandidate) -> None:
 
 
 def _require_current_semantic_generation(
-    connection: sqlite3.Connection, project: Project, hit: SemanticRetrievalHit
+    connection: sqlite3.Connection,
+    project: Project,
+    hit: SemanticRetrievalHit,
+    *,
+    max_rows: int | None = None,
 ) -> None:
     row = connection.execute(
         """SELECT generation.source_snapshot_sha256
@@ -271,16 +429,27 @@ def _require_current_semantic_generation(
         (project.project_id, hit.embedding_profile_id, hit.vector_generation_id),
     ).fetchone()
     if row is None:
+        if max_rows is not None:
+            from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+            raise ScopedRetrievalError("VECTOR_NOT_CURRENT")
         raise HybridRetrievalIntegrityError(
             "semantic generation is no longer the published generation"
         )
     sources, snapshot = _current_snapshot(
-        connection, project_id=project.project_id, embedding_profile_id=hit.embedding_profile_id
+        connection,
+        project_id=project.project_id,
+        embedding_profile_id=hit.embedding_profile_id,
+        max_rows=max_rows,
     )
     if (
         str(row[0]) != snapshot
-        or _generation_sources(connection, hit.vector_generation_id) != sources
+        or _generation_sources(connection, hit.vector_generation_id, max_rows=max_rows) != sources
     ):
+        if max_rows is not None:
+            from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
+
+            raise ScopedRetrievalError("VECTOR_NOT_CURRENT")
         raise HybridRetrievalIntegrityError("semantic generation is no longer current")
 
 
