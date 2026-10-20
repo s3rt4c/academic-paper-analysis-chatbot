@@ -1053,3 +1053,200 @@ def test_inspection_probe_consumes_option_values_and_ignores_other_command_argum
     assert _is_inspection_invocation(
         ["--data-root=inspect", "--max-pdf-bytes=100", "evidence-bundle", "inspect"]
     )
+
+
+def test_v11_default_gate_skips_before_paths_and_is_independent_of_mvp(monkeypatch):
+    from pathlib import Path
+
+    from tests.integration.generation.test_v11_live import _PATH_ENV, _live_paths
+
+    monkeypatch.setenv("ACADEMIC_CHATBOT_RUN_MVP_LLAMA_CPP", "1")
+    monkeypatch.setenv("ACADEMIC_CHATBOT_RUN_V11_LLAMA_CPP", "0")
+    for name in _PATH_ENV.values():
+        monkeypatch.setenv(name, "invalid")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("default gate touched artifacts")
+
+    monkeypatch.setattr(Path, "is_absolute", forbidden)
+    with pytest.raises(pytest.skip.Exception):
+        _live_paths()
+
+
+@pytest.mark.parametrize("damage", ["missing", "relative", "wrong_kind"])
+def test_v11_opt_in_artifact_configuration_errors_are_failures(tmp_path, monkeypatch, damage):
+    from tests.integration.generation.test_v11_live import _DIRECTORIES, _PATH_ENV, _live_paths
+
+    monkeypatch.setenv("ACADEMIC_CHATBOT_RUN_V11_LLAMA_CPP", "1")
+    monkeypatch.setenv("ACADEMIC_CHATBOT_RUN_MVP_LLAMA_CPP", "0")
+    for role, name in _PATH_ENV.items():
+        path = tmp_path / role
+        path.mkdir() if role in _DIRECTORIES else path.write_text("synthetic")
+        monkeypatch.setenv(name, str(path))
+    name = _PATH_ENV["model"]
+    if damage == "missing":
+        monkeypatch.delenv(name)
+    elif damage == "relative":
+        monkeypatch.setenv(name, "relative")
+    else:
+        monkeypatch.setenv(name, str(tmp_path))
+    with pytest.raises(pytest.fail.Exception):
+        _live_paths()
+
+
+
+def _ask_root_arguments(data_root: Path, artifact_root: Path) -> list[str]:
+    arguments = [
+        "--data-root", str(data_root), "--max-pdf-bytes", "1000000",
+        "ask", "--project-id", "p", "--paper-id", "paper",
+        "--question", "What is the objective?", "--embedding-profile-id", "profile-one",
+    ]
+    for flag, name in (
+        ("--embedding-model-root", "embedding"), ("--runtime-dir", "runtime"),
+        ("--runtime-manifest", "runtime.json"), ("--model", "model.gguf"),
+        ("--model-manifest", "model.json"),
+    ):
+        arguments.extend((flag, str(artifact_root / name)))
+    return arguments
+
+
+@pytest.mark.parametrize("placement", ["root", "ancestor"])
+@pytest.mark.parametrize("alias_kind", ["symlink", "reparse"])
+def test_ask_rejects_raw_root_alias_before_any_authority_access(
+    tmp_path, monkeypatch, capsys, placement, alias_kind
+):
+    import socket
+    import sqlite3
+    import stat
+    import subprocess
+
+    from academic_chatbot import cli
+    from academic_chatbot.library.service import LibraryService
+
+    canonical = tmp_path / "canonical" / "data"
+    LibraryService(data_root=canonical, max_pdf_bytes=1000000).create_project(
+        display_name="Synthetic", project_id="p"
+    )
+    alias = tmp_path / "SECRET-RAW-ALIAS"
+    target = canonical if placement == "root" else canonical.parent
+    supplied = alias if placement == "root" else alias / "data"
+    original_resolve, original_lstat = Path.resolve, Path.lstat
+
+    def resolve(path, *args, **kwargs):
+        if path.is_relative_to(alias):
+            path = target / path.relative_to(alias)
+        return original_resolve(path, *args, **kwargs)
+
+    def lstat(path, *args, **kwargs):
+        if path == alias:
+            return SimpleNamespace(
+                st_mode=stat.S_IFLNK if alias_kind == "symlink" else stat.S_IFDIR,
+                st_file_attributes=0 if alias_kind == "symlink" else 0x400,
+            )
+        if path.is_relative_to(alias):
+            path = target / path.relative_to(alias)
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    calls = dict.fromkeys(
+        ("repository", "source", "sqlite", "scoped", "semantic", "evidence",
+         "bundle", "generation", "generate", "runtime", "network", "subprocess"), 0
+    )
+
+    def watch(owner, attribute, boundary):
+        original = getattr(owner, attribute)
+
+        def observed(*args, **kwargs):
+            calls[boundary] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, attribute, observed)
+
+    def forbid(owner, attribute, boundary):
+        def forbidden(*args, **kwargs):
+            calls[boundary] += 1
+            raise AssertionError("unsafe root reached " + boundary)
+
+        monkeypatch.setattr(owner, attribute, forbidden)
+
+    watch(cli.ProjectRepository, "__init__", "repository")
+    watch(cli.ProjectRepository, "sole_current_paper_source_read_only", "source")
+    watch(cli, "_build_scoped_retrieval", "scoped")
+    watch(cli.EvidenceBundleService, "__init__", "evidence")
+    watch(cli.LocalGenerationService, "__init__", "generation")
+    watch(cli._LazyVerifiedLlamaCppModel, "__init__", "runtime")
+    forbid(sqlite3, "connect", "sqlite")
+    forbid(cli.SemanticRetrievalService, "open_from_model_root", "semantic")
+    forbid(cli.EvidenceBundleService, "build", "bundle")
+    forbid(cli.LocalGenerationService, "generate", "generate")
+    forbid(socket.socket, "connect", "network")
+    forbid(subprocess, "Popen", "subprocess")
+
+    code = main(_ask_root_arguments(supplied, tmp_path))
+    captured = capsys.readouterr()
+    assert calls == dict.fromkeys(calls, 0)
+    assert code == 2 and captured.err == ""
+    assert captured.out == (
+        '{"code":"INVALID_REQUEST","message":"Generation request is invalid",'
+        '"outcome":"rejected","schema_version":"mvp-local-generation-result-v1"}\n'
+    )
+    assert str(tmp_path) not in captured.out and "SECRET" not in captured.out
+
+
+@pytest.mark.parametrize("paper_state", ["unknown", "unpublished"])
+def test_ask_canonical_root_admits_source_before_lazy_artifacts(
+    tmp_path, monkeypatch, capsys, paper_state
+):
+    from academic_chatbot import cli
+    from academic_chatbot.library.service import LibraryService
+
+    root = tmp_path / "data"
+    library = LibraryService(data_root=root, max_pdf_bytes=1000000)
+    library.create_project(display_name="Synthetic", project_id="p")
+    if paper_state == "unpublished":
+        library.create_paper(project_id="p", paper_id="paper")
+    admitted = []
+    original = cli.ProjectRepository.sole_current_paper_source_read_only
+
+    def source(repository, **kwargs):
+        admitted.append(kwargs)
+        return original(repository, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("source rejection must precede artifact access")
+
+    monkeypatch.setattr(cli.ProjectRepository, "sole_current_paper_source_read_only", source)
+    monkeypatch.setattr(cli.SemanticRetrievalService, "open_from_model_root", forbidden)
+    monkeypatch.setattr(cli, "load_llama_runtime_manifest", forbidden)
+    assert main(_ask_root_arguments(root, tmp_path)) == 2
+    captured = capsys.readouterr()
+    assert admitted == [{"project_id": "p", "paper_id": "paper"}]
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["outcome"] == "rejected"
+    assert payload["code"] == (
+        "INVALID_REQUEST" if paper_state == "unknown" else "SOURCE_NOT_CURRENT"
+    )
+
+
+@pytest.mark.parametrize(
+    ("damage", "outcome", "code"),
+    [("missing", "failed", "AUTHORITY_UNAVAILABLE"),
+     ("wrong_kind", "rejected", "INVALID_REQUEST"),
+     ("relative", "rejected", "INVALID_REQUEST")],
+)
+def test_ask_root_admission_preserves_storage_error_taxonomy(
+    tmp_path, capsys, damage, outcome, code
+):
+    root = tmp_path / "missing-data"
+    if damage == "wrong_kind":
+        root.write_text("not a directory", encoding="utf-8")
+    elif damage == "relative":
+        root = Path("relative-data")
+    assert main(_ask_root_arguments(root, tmp_path)) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["outcome"] == outcome and payload["code"] == code
+    assert str(tmp_path) not in captured.out
