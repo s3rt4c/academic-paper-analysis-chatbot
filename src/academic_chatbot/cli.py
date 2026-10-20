@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
     from academic_chatbot.evidence.inspection_models import EvidenceInspectionResult
-    from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
     from academic_chatbot.retrieval.scoped_service import SourceScopedRetrievalService
 
 from academic_chatbot.documents.import_service import DocumentImportService
@@ -54,9 +53,9 @@ from academic_chatbot.generation.models import (
     LocalGenerationRejectionCode,
     LocalGenerationResult,
 )
-from academic_chatbot.generation.orchestrator import SinglePaperAskService
+from academic_chatbot.generation.orchestrator import SinglePaperAskService, _scoped_error
 from academic_chatbot.generation.service import LocalGenerationService
-from academic_chatbot.library.repository import ProjectRepository
+from academic_chatbot.library.repository import ProjectRepository, guard_scoped_database
 from academic_chatbot.library.service import LibraryService
 from academic_chatbot.ports.model import (
     CancellationSignal,
@@ -68,6 +67,7 @@ from academic_chatbot.retrieval.hybrid_service import (
     HybridRetrievalIntegrityError,
     HybridRetrievalService,
 )
+from academic_chatbot.retrieval.scoped_models import ScopedRetrievalError
 from academic_chatbot.retrieval.semantic import (
     SemanticArtifactIntegrityError,
     SemanticIndexStaleError,
@@ -343,6 +343,8 @@ def _dispatch_ask(arguments: argparse.Namespace) -> int:
         )
     try:
         service = _build_ask_service(arguments)
+    except ScopedRetrievalError as error:
+        return _write_generation_result(_scoped_error(error))
     except (
         EmbeddingArtifactError,
         EmbeddingPersistenceError,
@@ -384,7 +386,9 @@ def _dispatch_ask(arguments: argparse.Namespace) -> int:
 
 def _build_ask_service(arguments: argparse.Namespace) -> SinglePaperAskService:
     data_root = Path(arguments.data_root)
-    paths = ProjectPaths.create(data_root, project_id=arguments.project_id)
+    if not data_root.is_absolute():
+        raise ScopedRetrievalError("UNSAFE_PATH")
+    paths = guard_scoped_database(data_root, arguments.project_id)
     resolver = EvidenceReadResolver(data_root=data_root)
 
     scoped_arguments = argparse.Namespace(**vars(arguments))
